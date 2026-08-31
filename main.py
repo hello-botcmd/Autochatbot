@@ -6,7 +6,12 @@ from pyrogram import Client, filters
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from aichat import load_data, register_ai_handler, save_data
-from sendphoto import register_sendphoto_handler
+from sendphoto import (
+    clear_paid_post,
+    format_paid_post,
+    register_sendphoto_handler,
+    save_post_from_link,
+)
 from stats import get_stats_text
 
 load_dotenv()
@@ -106,16 +111,95 @@ async def callback_handler(client, query: CallbackQuery):
         )
 
     elif query.data == "set_photo_menu":
+        user_states.pop(user_id, None)
+        saved_users = data.get("users", {})
+        if not saved_users:
+            await query.answer("No accounts connected! Add an account first.", show_alert=True)
+            return
+
         text = (
-            "💎 **Paid Photo Channel Settings**\n\n"
-            "Current Default Channel: `@krishbharti`\n"
-            "Active Trigger Commands: `.send`, `send`, `.star`\n\n"
-            "When triggered in private DMs, connected userbots will automatically copy and reply with a photo from the configured channel."
+            "💎 **Paid Photo Module**\n\n"
+            "Select an account. That userbot will **forward your saved channel post** "
+            "when someone sends `send`, `.send`, or `.star` in a private DM.\n\n"
+            "AI auto-reply is skipped for those trigger words.\n\n"
+            "🟢 = Online   ⚪ = Offline   📎 = Post saved"
         )
+        btns = []
+        for uid, uinfo in saved_users.items():
+            is_active = uid in connected_clients
+            indicator = "🟢" if is_active else "⚪"
+            badge = "📎" if uinfo.get("paid_photo") else "➕"
+            acc_name = uinfo.get("name", f"User {uid}")
+            btns.append([
+                InlineKeyboardButton(
+                    f"{indicator} {badge} {acc_name}",
+                    callback_data=f"photo_acc_{uid}",
+                )
+            ])
+        btns.append([InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="back_main")])
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(btns))
+
+    elif query.data.startswith("photo_acc_"):
+        user_states.pop(user_id, None)
+        target_uid = query.data.replace("photo_acc_", "")
+        saved_users = data.get("users", {})
+        uinfo = saved_users.get(target_uid, {})
+        if not uinfo:
+            await query.answer("Account data missing!", show_alert=True)
+            return
+
+        is_connected = target_uid in connected_clients
+        acc_name = uinfo.get("name", "Unknown User")
+        conn_status = "Connected 🟢" if is_connected else "Offline 🔴"
+        post = uinfo.get("paid_photo")
+
+        text = (
+            f"💎 **Paid Photo — {acc_name}**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• **User ID:** `{target_uid}`\n"
+            f"• **Session:** {conn_status}\n"
+            f"• **Triggers:** `send`  `.send`  `.star`\n\n"
+            f"📎 **Saved Post**\n{format_paid_post(post)}"
+        )
+        btns = [
+            [InlineKeyboardButton("📎 Set / Change Post Link", callback_data=f"photo_set_{target_uid}")],
+            [InlineKeyboardButton("🧹 Clear Saved Post", callback_data=f"photo_clear_{target_uid}")],
+            [InlineKeyboardButton("⬅️ Back to Accounts", callback_data="set_photo_menu")],
+        ]
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(btns))
+
+    elif query.data.startswith("photo_set_"):
+        target_uid = query.data.replace("photo_set_", "")
+        if target_uid not in data.get("users", {}):
+            await query.answer("Account data missing!", show_alert=True)
+            return
+        if target_uid not in connected_clients:
+            await query.answer("Account is offline. Reconnect the session first.", show_alert=True)
+            return
+
+        user_states[user_id] = f"AWAITING_POST:{target_uid}"
+        acc_name = data["users"][target_uid].get("name", target_uid)
         markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="back_main")]
+            [InlineKeyboardButton("⬅️ Cancel", callback_data=f"photo_acc_{target_uid}")]
         ])
-        await query.message.edit_text(text, reply_markup=markup)
+        await query.message.edit_text(
+            f"🔗 **Send a channel post link**\n\n"
+            f"Account: **{acc_name}**\n\n"
+            "Paste a Telegram post link (public or private):\n"
+            "• `https://t.me/mychannel/1234`\n"
+            "• `https://t.me/c/1234567890/55`\n\n"
+            "The connected account must have access to that channel.",
+            reply_markup=markup,
+        )
+
+    elif query.data.startswith("photo_clear_"):
+        target_uid = query.data.replace("photo_clear_", "")
+        if clear_paid_post(target_uid):
+            await query.answer("Saved post cleared!", show_alert=True)
+        else:
+            await query.answer("No saved post on this account.", show_alert=True)
+        query.data = f"photo_acc_{target_uid}"
+        await callback_handler(client, query)
 
     elif query.data == "manage_acc":
         saved_users = data.get("users", {})
@@ -245,12 +329,13 @@ async def user_input_handler(client, message: Message):
             connected_clients[acc_uid] = user_client
 
             data = load_data()
-            data.setdefault("users", {})[acc_uid] = {
+            existing = data.setdefault("users", {}).get(acc_uid, {})
+            existing.update({
                 "name": acc_name,
                 "session": session_string,
-                "ai_enabled": True,
-                "history": {},
-            }
+                "ai_enabled": existing.get("ai_enabled", True),
+            })
+            data["users"][acc_uid] = existing
             save_data(data)
 
             user_states.pop(user_id, None)
@@ -275,6 +360,43 @@ async def user_input_handler(client, message: Message):
             await status_msg.edit_text(
                 f"❌ **Failed to Connect Session:** `{e}`",
                 reply_markup=markup
+            )
+        return
+
+    if isinstance(state, str) and state.startswith("AWAITING_POST:"):
+        target_uid = state.split(":", 1)[1]
+        link = (message.text or "").strip()
+        status_msg = await message.reply_text("🔄 Resolving channel post via the connected account...")
+
+        markup_back = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back", callback_data=f"photo_acc_{target_uid}")]
+        ])
+
+        if target_uid not in connected_clients:
+            user_states.pop(user_id, None)
+            await status_msg.edit_text(
+                "❌ That account is offline. Reconnect the session first.",
+                reply_markup=markup_back,
+            )
+            return
+
+        ok, result_text = await save_post_from_link(
+            connected_clients[target_uid],
+            target_uid,
+            link,
+        )
+
+        if ok:
+            user_states.pop(user_id, None)
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("💎 View Account Photo Settings", callback_data=f"photo_acc_{target_uid}")],
+                [InlineKeyboardButton("⬅️ Return to Dashboard", callback_data="back_main")],
+            ])
+            await status_msg.edit_text(result_text, reply_markup=markup)
+        else:
+            await status_msg.edit_text(
+                f"❌ {result_text}\n\nSend another link, or tap Cancel.",
+                reply_markup=markup_back,
             )
 
 
