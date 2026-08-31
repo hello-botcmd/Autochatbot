@@ -46,6 +46,7 @@ def load_data() -> dict:
             data.setdefault(k, v)
         return data
     except (json.JSONDecodeError, OSError):
+        save_data(_default_data)
         return json.loads(json.dumps(_default_data))
 
 
@@ -262,6 +263,15 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
 
         if user_id in data.get("blocked", []):
             return
+
+        # Paid-photo trigger words skip AI so only the saved post is sent.
+        try:
+            from sendphoto import account_has_paid_post, is_send_trigger
+
+            if is_send_trigger(message.text) and account_has_paid_post(owner_id_str):
+                return
+        except Exception:
+            pass
 
         now = time.time()
 
