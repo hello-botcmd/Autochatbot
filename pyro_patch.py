@@ -34,6 +34,8 @@ def apply_pyrogram_peer_patch() -> None:
     orig_handle_updates = Client.handle_updates
 
     async def handle_updates_safe(self, updates):
+        # FIX: only guard the known peer-resolution failures.
+        # All other exceptions now propagate so real bugs aren't silently lost.
         try:
             return await orig_handle_updates(self, updates)
         except ValueError as e:
@@ -43,9 +45,6 @@ def apply_pyrogram_peer_patch() -> None:
             raise
         except KeyError as e:
             print(f"[pyrogram] ignored missing peer: {e}")
-            return None
-        except Exception as e:
-            print(f"[pyrogram] handle_updates error: {e}")
             return None
 
     Client.handle_updates = handle_updates_safe
