@@ -525,12 +525,13 @@ async def main():
 
 
 if __name__ == "__main__":
-    # NEW: explicit loop creation. Pyrogram 2.0 binds dispatcher queues to the
-    # loop current at Client construction (import time); this keeps the SAME
-    # loop for run_until_complete, and avoids the bare get_event_loop()
-    # deprecation on Python 3.12+.
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    # CRITICAL: Clients (bot + userbots) are constructed at module import,
+    # which binds their dispatcher queues to the loop current at that moment.
+    # get_event_loop() here returns that SAME loop object, keeping everything
+    # on one loop. DO NOT "modernize" this to asyncio.new_event_loop() /
+    # asyncio.run() — a second loop means clients start but process ZERO
+    # updates: dashboard bot, AI replies, and triggers all go silent, no errors.
+    loop = asyncio.get_event_loop()
 
     import pyrogram
     print(f"[diag] python {platform.python_version()} | "
