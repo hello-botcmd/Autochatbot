@@ -532,8 +532,9 @@ if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    import pyrogram
     print(f"[diag] python {platform.python_version()} | "
-          f"pyrogram {__import__('pyrogram.version', fromlist=['__version__']).__version__}")
+          f"pyrogram {getattr(pyrogram, '__version__', 'unknown')}")
     print(f"[diag] admins configured: {len(ADMIN_IDS)} | "
           f"openrouter key: {'set ✅' if OPENROUTER_API_KEY else 'MISSING ❌'} | "
           f"api_id: {'set' if API_ID else 'MISSING'}")
