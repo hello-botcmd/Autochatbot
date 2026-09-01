@@ -101,6 +101,7 @@ def _read_sync() -> dict:
 
     for k, v in _default_data.items():
         data.setdefault(k, v)
+    data = _repair(data)
     return data
 
 
