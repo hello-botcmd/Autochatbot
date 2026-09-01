@@ -25,7 +25,7 @@ API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "nonsecularman")
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "sexyiwowu")
 
 START_PIC_URL = "https://images.unsplash.com/photo-1503376780353-7e6692767b70"
 
