@@ -348,7 +348,7 @@ async def user_input_handler(client, message: Message):
     if not is_admin(message.from_user.id):
         return
 
-    # FIX: guard non-text input (sticker/photo while in a waiting state)
+    # Guard non-text input (sticker/photo while in a waiting state)
     if not message.text:
         return
 
@@ -373,8 +373,10 @@ async def user_input_handler(client, message: Message):
             acc_uid = str(me.id)
             acc_name = me.first_name or f"User {acc_uid}"
 
-            register_ai_handler(user_client, acc_uid, OPENROUTER_API_KEY)
+            # sendphoto first (group -1), then aichat (group 0), so the
+            # paid-photo trigger always gets priority over AI replies.
             register_sendphoto_handler(user_client, acc_uid)
+            register_ai_handler(user_client, acc_uid, OPENROUTER_API_KEY)
             connected_clients[acc_uid] = user_client
 
             def _save_session(d):
@@ -461,6 +463,7 @@ async def main():
                 session_string=udata["session"],
                 in_memory=True,
             )
+            # sendphoto first (group -1), then aichat (group 0)
             register_sendphoto_handler(cli, str(uid))
             register_ai_handler(cli, uid, OPENROUTER_API_KEY)
             await cli.start()
@@ -472,17 +475,36 @@ async def main():
     print("All sessions restored. Running...")
     await idle()
 
-    # Graceful shutdown
+    # Graceful shutdown — never let a broken client or dispatcher
+    # crash the exit sequence.
     print("Shutting down...")
     for uid, cli in list(connected_clients.items()):
         try:
             await cli.stop()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[shutdown] failed to stop session {uid}: {e}")
         connected_clients.pop(uid, None)
-    await bot.stop()
+
+    try:
+        await bot.stop()
+    except Exception as e:
+        print(f"[shutdown] bot.stop() error (ignored): {e}")
     print("Shutdown complete.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Pyrogram 2.0 binds its dispatcher queues to the event loop that is
+    # current when the Clients are constructed (at import time, above).
+    # asyncio.run() creates a NEW loop -> "attached to a different loop"
+    # on shutdown. Using get_event_loop() + run_until_complete() keeps
+    # everything on the same loop, matching how the clients were created.
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Interrupted by user.")
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
