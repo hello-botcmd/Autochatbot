@@ -6,11 +6,11 @@
     1. copy_message / copy_media_group  -> clean copy, no header
     2. download + re-upload             -> clean, works where copy fails
     3. forward                          -> LAST RESORT only (header appears,
-       logged loudly). Fix properly by upgrading pyrogram>=2.0.30 or unsetting
+       logged loudly). Fix properly with pyrogram>=2.0.30 / pyrofork, or unset
        'restrict saving content' on the source channel.
 • The group -1 handler NEVER lets an exception escape: on Pyrogram, an
-  exception here aborts later handler groups (aichat's group 0) for the
-  same update — which is one of the ways AI replies went silent.
+  exception here aborts later handler groups (aichat's group 0) for the same
+  update — one of the classic ways AI replies went silent.
 """
 
 import os
@@ -22,12 +22,8 @@ from pyrogram.types import Message
 
 from storage import load_data, update_data
 
-# Trigger words. Matched case-insensitively. Full-message match still works,
-# plus word-boundary matches inside sentences ("pls send it" triggers,
-# "resend" / "sending" / "starfish" don't).
 PHOTO_TRIGGERS = {"send", ".send", "!send", "/send", "star", ".star", "!star", "/star"}
 
-# Set TRIGGER_IN_SENTENCE=0 in .env to go back to exact-match only.
 TRIGGER_IN_SENTENCE = os.getenv("TRIGGER_IN_SENTENCE", "1") == "1"
 
 _TRIGGER_RES = [re.compile(rf"(?<!\w){re.escape(w)}(?!\w)") for w in PHOTO_TRIGGERS]
@@ -43,20 +39,10 @@ def is_send_trigger(text: str) -> bool:
         return True
     if not TRIGGER_IN_SENTENCE:
         return False
-    # "resend" -> 'send' preceded by word char -> no match.
-    # "sending" -> 'send' followed by word char -> no match.
-    # "pls .send it" -> matches.
     return any(rx.search(t) for rx in _TRIGGER_RES)
 
 
 def parse_post_link(link: str):
-    """
-    Supports:
-      https://t.me/channelusername/123  -> public channel
-      https://t.me/c/1234567890/123     -> private channel (internal id)
-      https://telegram.me/...           -> same forms
-    Returns (chat_ref, message_id) or (None, None).
-    """
     if not link:
         return None, None
 
@@ -79,8 +65,6 @@ def parse_post_link(link: str):
 # ------------------------- POST STORAGE (multiple) ------------------------- #
 
 def _posts_of(user: dict) -> list:
-    """All saved posts, with lazy backward-compat migration of old single
-    `paid_photo` into the new `paid_photos` list."""
     if not user:
         return []
     if "paid_photos" in user:
@@ -98,8 +82,6 @@ async def get_all_paid_posts(owner_id: str) -> list:
 
 
 async def get_next_paid_post(owner_id: str):
-    """Round-robin pick. Selecting a post and advancing the rotation cursor
-    happen inside ONE atomic update_data, so concurrent DMs can't race."""
     def _pick(d):
         user = d.get("users", {}).get(str(owner_id), {})
         posts = _posts_of(user)
@@ -178,8 +160,6 @@ def format_paid_posts(posts: list) -> str:
 # ------------------------------ SAVE FLOW ---------------------------------- #
 
 async def save_post_from_link(user_client: Client, owner_id: str, link: str):
-    """Resolve a t.me post link through the connected userbot and APPEND it to
-    the account's rotation list. Returns (ok: bool, message: str)."""
     chat_ref, msg_id = parse_post_link(link)
     if chat_ref is None:
         return False, (
@@ -225,8 +205,8 @@ async def save_post_from_link(user_client: Client, owner_id: str, link: str):
             f"• **Chat ID:** `{chat.id}`\n"
             f"• **Message ID:** `{msg_id}`\n"
             f"• **Link:** `{link.strip()}`\n\n"
-            "Trigger words anywhere in a DM (`send`, `star`, …) will deliver "
-            "posts in round-robin order — sent directly, no forward header."
+            "Trigger words anywhere in a DM will deliver posts in round-robin "
+            "order — sent directly, no forward header."
         )
     except Exception as e:
         return False, (
@@ -238,7 +218,6 @@ async def save_post_from_link(user_client: Client, owner_id: str, link: str):
 # ------------------------------ DELIVERY ----------------------------------- #
 
 async def _resolve_source_chat(client: Client, post: dict):
-    """Re-resolve the saved source so the peer exists in this in-memory session."""
     username = post.get("username")
     if username:
         try:
@@ -267,16 +246,13 @@ async def _resolve_source_chat(client: Client, post: dict):
 
 async def _reupload_message(client: Client, from_chat_id, message_id,
                             target_chat_id: int) -> bool:
-    """Download the source message's media and re-send it as the userbot.
-    Clean (no header), and works where copy is restricted — when downloads
-    are allowed. Returns False when unsupported."""
     try:
         msg = await client.get_messages(from_chat_id, message_id)
     except Exception as e:
         print(f"[sendphoto] reupload get_messages failed: {e}")
         return False
     if getattr(msg, "media_group_id", None):
-        return False  # albums: not supported here; copy_media_group is tried first
+        return False
     try:
         if getattr(msg, "text", None):
             await client.send_message(target_chat_id, msg.text.markdown)
@@ -317,15 +293,12 @@ async def _reupload_message(client: Client, from_chat_id, message_id,
 
 
 async def deliver_saved_post(client: Client, post: dict, target_chat_id: int):
-    """Send the saved post AS the userbot itself so Telegram shows NO
-    'Forwarded from <channel>' header. Chain: copy -> re-upload -> forward.
-    Returns (ok: bool, used_forward: bool)."""
+    """Chain: copy -> re-upload -> forward. Returns (ok, used_forward)."""
     from_chat_id = await _resolve_source_chat(client, post)
     message_id = post["message_id"]
 
     copy_msg = getattr(client, "copy_message", None)
 
-    # 1. Clean copy (no header). copy_message needs pyrogram >= 2.0.30.
     if copy_msg is not None:
         try:
             msg = None
@@ -352,23 +325,20 @@ async def deliver_saved_post(client: Client, post: dict, target_chat_id: int):
         except Exception as e:
             print(f"[sendphoto] copy failed ({e}); trying re-upload")
 
-        # 2. Re-upload (clean, no header) — works where copy is restricted.
         if await _reupload_message(client, from_chat_id, message_id, target_chat_id):
             return True, False
     else:
         print(
-            "[sendphoto] copy_message missing (pyrogram too old, need >= 2.0.30); "
-            "trying re-upload"
+            "[sendphoto] copy_message missing (pyrogram too old, need >= 2.0.30 "
+            "or pyrofork); trying re-upload"
         )
         if await _reupload_message(client, from_chat_id, message_id, target_chat_id):
             return True, False
 
-    # 3. LAST RESORT: forward — the header WILL be shown. Loudly logged so
-    #    the cause is visible instead of the user getting silence.
     print(
         "[sendphoto] FALLING BACK TO FORWARD — 'Forwarded from' header will show. "
-        "Proper fixes: pip install -U 'pyrogram>=2.0.30', or unset 'restrict "
-        "saving content' on the source channel."
+        "Proper fixes: pip install -U pyrofork, or unset 'restrict saving "
+        "content' on the source channel."
     )
     try:
         await client.forward_messages(
@@ -389,7 +359,7 @@ def register_sendphoto_handler(user_client: Client, owner_id: str):
 
     @user_client.on_message(
         filters.private & ~filters.me & ~filters.bot & ~filters.service,
-        group=-1,  # runs BEFORE aichat's group-0 handler, else it never fires
+        group=-1,
     )
     async def paid_photo_trigger(client: Client, message: Message):
         try:
@@ -398,7 +368,7 @@ def register_sendphoto_handler(user_client: Client, owner_id: str):
 
             post = await get_next_paid_post(owner_id_str)
             if post is None:
-                return  # no posts set -> fall through, AI auto-reply handles it
+                return  # no posts -> fall through to AI
 
             try:
                 await client.send_chat_action(message.chat.id, "typing")
@@ -410,8 +380,7 @@ def register_sendphoto_handler(user_client: Client, owner_id: str):
             )
 
             if not ok:
-                # FIX (total silence): on failure fall through to AI instead of
-                # raising StopPropagation — the user gets an answer either way.
+                # Fall through to AI instead of StopPropagation — no silence.
                 print(
                     f"[sendphoto] could not deliver post for account "
                     f"{owner_id_str}; falling through to AI"
@@ -421,14 +390,10 @@ def register_sendphoto_handler(user_client: Client, owner_id: str):
             if used_forward:
                 print(f"[sendphoto] delivered via forward (header shown) for {owner_id_str}")
 
-            # Post delivered — stop AI from also replying. This is now the
-            # ONLY gate between trigger messages and AI.
             raise StopPropagation
 
         except StopPropagation:
             raise
         except Exception as e:
-            # FIX (AI killed by sendphoto crashes): an exception escaping a
-            # group -1 handler aborts Pyrogram's later handler groups (AI's
-            # group 0) for this update. Swallow & log so it can never do that.
+            # Never abort later handler groups (AI's group 0).
             print(f"[sendphoto] trigger handler error: {e}")
