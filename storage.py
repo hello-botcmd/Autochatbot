@@ -60,7 +60,26 @@ def _write_sync(data: dict) -> None:
         except OSError:
             pass
         raise
-
+def _repair(data: dict) -> dict:
+    """Coerce legacy/corrupt scalar values on disk into the shapes the code
+    expects. Runs on every read, so inconsistent data.json self-heals."""
+    if not isinstance(data.get("users"), dict):
+        data["users"] = {}
+    if not isinstance(data.get("history"), dict):
+        data["history"] = {}
+    if not isinstance(data.get("last_msg_time"), dict):
+        data["last_msg_time"] = {}
+    if not isinstance(data.get("rate_limited_until"), dict):
+        data["rate_limited_until"] = {}   # <- the int that killed DMs
+    if not isinstance(data.get("blocked"), list):
+        data["blocked"] = []
+    for uid, u in list(data["users"].items()):
+        if not isinstance(u, dict):
+            data["users"][uid] = {"session": str(u)}
+            continue
+        if u.get("paid_photos") is not None and not isinstance(u["paid_photos"], list):
+            u.pop("paid_photos", None)
+    return data
 
 def _read_sync() -> dict:
     if not os.path.exists(DATA_FILE):
