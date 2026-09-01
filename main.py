@@ -48,9 +48,18 @@ ADMIN_IDS = {
 
 START_PIC_URL = "https://images.unsplash.com/photo-1503376780353-7e6692767b70"
 
+# Create and install the event loop BEFORE constructing the Pyrogram Client.
+# Pyrogram binds its dispatcher queues to the loop that is current at Client
+# construction time. Installing our loop here guarantees the bot, all
+# userbot clients (created later inside main()), and the __main__ runner all
+# share ONE loop — no "attached to a different loop" shutdown crash, and no
+# deprecated get_event_loop().
+_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(_loop)
+
 connected_clients = {}
 user_states = {}
-bot = None  # constructed inside main(), on the running event loop
+bot = Client("DashboardBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 
 def is_admin(user_id: int) -> bool:
