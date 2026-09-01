@@ -6,17 +6,23 @@
 3. handle_updates guards only swallow known peer-resolution failures.
 """
 
-_LOGGED_UNKNOWN_CONSTRUCTOR = False
+import logging
+
+log = logging.getLogger(__name__)
+
+# Per-category one-time suppression flags. Sharing a single flag meant one
+# weird constructor permanently silenced ALL update errors, including real
+# bugs. Unknown-constructor ids are also logged individually (once each).
+_logged_unknown_constructors: set = set()
+_logged_missing_peers: set = set()
 
 
 def apply_pyrogram_peer_patch() -> None:
-    global _LOGGED_UNKNOWN_CONSTRUCTOR
-
     try:
         from pyrogram import utils as pyro_utils
         from pyrogram.client import Client
     except Exception as e:
-        print(f"[pyro_patch] skip: {e}")
+        log.warning("pyro_patch skipped: %s", e)
         return
 
     # ---------------- 1. Peer-id constants ---------------- #
@@ -33,7 +39,9 @@ def apply_pyrogram_peer_patch() -> None:
 
     for name, value in (
         ("MIN_CHANNEL_ID", -100999999999999),
+        ("MAX_CHANNEL_ID", -100000000000000),
         ("MIN_CHAT_ID", -999999999999),
+        ("MAX_CHAT_ID", -999),
         ("MAX_USER_ID", 999999999999),
     ):
         if hasattr(pyro_utils, name):
@@ -49,35 +57,37 @@ def apply_pyrogram_peer_patch() -> None:
         orig_handle_packet = Session.handle_packet
 
         async def handle_packet_safe(self, packet):
-            # FIX (UnboundLocalError): the assignment below made Python treat
-            # this name as a local. It must be declared global INSIDE this
-            # nested function, not only in the enclosing one.
-            global _LOGGED_UNKNOWN_CONSTRUCTOR
             try:
                 return await orig_handle_packet(self, packet)
             except ValueError as e:
                 if "unknown constructor" in str(e):
-                    if not _LOGGED_UNKNOWN_CONSTRUCTOR:
-                        print(
-                            "[pyrogram] dropped update with unknown TL constructor "
-                            "(Telegram layer newer than installed schema). "
-                            "Further occurrences suppressed."
+                    cid = str(e)
+                    if cid not in _logged_unknown_constructors:
+                        _logged_unknown_constructors.add(cid)
+                        log.warning(
+                            "dropped update with unknown TL constructor (%s). "
+                            "This constructor id is suppressed from now on.",
+                            cid,
                         )
-                        _LOGGED_UNKNOWN_CONSTRUCTOR = True
                     return
                 raise
             except KeyError as e:
-                if not _LOGGED_UNKNOWN_CONSTRUCTOR:
-                    print(
-                        f"[pyrogram] dropped update with unknown constructor id {e}. "
-                        "Further occurrences suppressed."
+                # KeyError during deserialization = constructor id missing
+                # from the installed TL schema. Track per-id, not globally.
+                key = str(e)
+                if key not in _logged_unknown_constructors:
+                    _logged_unknown_constructors.add(key)
+                    log.warning(
+                        "dropped update with unknown constructor id %s "
+                        "(Telegram layer newer than installed schema). "
+                        "This id is suppressed from now on.",
+                        key,
                     )
-                    _LOGGED_UNKNOWN_CONSTRUCTOR = True
                 return
 
         Session.handle_packet = handle_packet_safe
     except Exception as e:
-        print(f"[pyro_patch] session guard skipped: {e}")
+        log.warning("session guard skipped: %s", e)
 
     # ---------------- 3. handle_updates guards ---------------- #
 
@@ -90,12 +100,15 @@ def apply_pyrogram_peer_patch() -> None:
             return await orig_handle_updates(self, updates)
         except ValueError as e:
             if "Peer id invalid" in str(e):
-                print(f"[pyrogram] ignored invalid peer: {e}")
+                log.warning("ignored invalid peer: %s", e)
                 return None
             raise
         except KeyError as e:
-            print(f"[pyrogram] ignored missing peer: {e}")
+            key = str(e)
+            if key not in _logged_missing_peers:
+                _logged_missing_peers.add(key)
+                log.warning("ignored missing peer: %s (further same-key errors suppressed)", e)
             return None
 
     Client.handle_updates = handle_updates_safe
-    print("[pyro_patch] applied peer-id + constructor + handle_updates guards")
+    log.info("pyro_patch: applied peer-id + constructor + handle_updates guards")
