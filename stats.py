@@ -5,6 +5,10 @@ import psutil
 
 START_TIME = time.time()
 
+# Prime the CPU counter. Without this, the first cpu_percent(interval=None)
+# call returns 0.0 because psutil has no previous sample to diff against.
+psutil.cpu_percent(interval=None)
+
 
 def get_formatted_uptime() -> str:
     uptime_seconds = int(time.time() - START_TIME)
