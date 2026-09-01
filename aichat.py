@@ -10,16 +10,46 @@ from storage import DEFAULT_PERSONA, load_data, update_data
 
 # --------------------------- CONFIG --------------------------- #
 
-# FIX: openai/gpt-chat-latest is not a real OpenRouter slug
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 OPENROUTER_FALLBACK_MODEL = os.getenv(
     "OPENROUTER_FALLBACK_MODEL", "google/gemini-2.0-flash-001"
 )
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+CREDITS_URL = "https://openrouter.ai/api/v1/credits"
 
 MAX_HISTORY_TURNS = 6
 COOLDOWN_SECONDS = 5
 REQUEST_TIMEOUT = 20  # was 45s (2 models x 2 attempts x 45s = 3 min worst case)
+
+# Owner notification cooldown after a quota-429 (hours).
+QUOTA_NOTIFY_COOLDOWN_HOURS = int(os.getenv("QUOTA_NOTIFY_COOLDOWN_HOURS", "6"))
+
+# --------------------------- CREDITS ----------------------------- #
+
+def _get_openrouter_credits_sync(api_key: str):
+    """Fetch OpenRouter balance. Returns (ok, remaining_or_error)."""
+    headers = {"Authorization": f"Bearer {api_key}"}
+    resp = requests.get(CREDITS_URL, headers=headers, timeout=15)
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}"
+    data = resp.json().get("data", {})
+    total = float(data.get("total_credits", 0) or 0)
+    usage = float(data.get("total_usage", 0) or 0)
+    return True, {"total": round(total, 4), "used": round(usage, 4),
+                  "remaining": round(total - usage, 4)}
+
+
+async def get_openrouter_credits(api_key: str):
+    return await asyncio.to_thread(_get_openrouter_credits_sync, api_key)
+
+
+def _credits_text(credits: dict) -> str:
+    return (
+        f"• **Total:** `{credits['total']}`\n"
+        f"• **Used:** `{credits['used']}`\n"
+        f"• **Remaining:** `{credits['remaining']}`"
+    )
+
 
 # --------------------------- AI CALL ----------------------------- #
 
@@ -144,6 +174,72 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
             or (f"@{target.username}" if target.username else str(target.id))
         )
 
+    async def _notify_owner_quota(model: str):
+        """Notify the account owner (Saved Messages) that AI quota is over.
+
+        Fires at most once per QUOTA_NOTIFY_COOLDOWN_HOURS, tracked in
+        data.json under users[owner_id]["quota_notify_until"].
+        """
+        now = time.time()
+
+        def _check_cooldown(d):
+            u = d.setdefault("users", {}).setdefault(owner_id_str, {})
+            if now < u.get("quota_notify_until", 0):
+                return False
+            u["quota_notify_until"] = now + QUOTA_NOTIFY_COOLDOWN_HOURS * 3600
+            return True
+
+        allowed = await update_data(_check_cooldown)
+        if not allowed:
+            return
+
+        lines = [
+            "🚨 **AI Credits / Quota Exhausted** 🚨",
+            "",
+            "OpenRouter returned **429 (quota limit)** while auto-replying.",
+            f"• **Model:** `{model}`",
+            f"• **Time:** `{time.strftime('%Y-%m-%d %H:%M:%S')}`",
+            "",
+            f"Next quota alert in `{QUOTA_NOTIFY_COOLDOWN_HOURS}h` "
+            f"(use `.aicredits` to check balance).",
+        ]
+
+        ok, credits = await get_openrouter_credits(api_key)
+        if ok:
+            lines.insert(6, "**Balance:**")
+            lines.insert(7, _credits_text(credits))
+            lines.insert(8, "")
+        else:
+            lines.insert(6, f"Balance check failed: `{credits}`")
+            lines.insert(7, "")
+
+        try:
+            # "me" = Saved Messages of the userbot account itself.
+            await user_client.send_message("me", "\n".join(lines))
+        except Exception as e:
+            print(f"[aichat] quota notify failed: {e}")
+
+    # -------------------------- COMMANDS ---------------------------- #
+
+    @user_client.on_message(filters.me & filters.command("aicredits", prefixes=[".", "!", "/"]))
+    async def aicredits_cmd(client: Client, message: Message):
+        if not api_key:
+            await message.edit_text("❌ `OPENROUTER_API_KEY` is not set.")
+            return
+
+        await message.edit_text("🔄 Fetching OpenRouter balance...")
+
+        ok, result = await get_openrouter_credits(api_key)
+        if ok:
+            await message.edit_text(
+                "💳 **OpenRouter Balance**\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"{_credits_text(result)}\n"
+                f"• **Model:** `{OPENROUTER_MODEL}`"
+            )
+        else:
+            await message.edit_text(f"❌ Balance check failed: `{result}`")
+
     @user_client.on_message(filters.me & filters.command("aichat", prefixes=[".", "!", "/"]))
     async def aichat_status(client: Client, message: Message):
         data = await load_data()
@@ -167,7 +263,8 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
             "• `.aichatoff <id/username>` — Turn AI OFF for target user\n"
             "• `.aichatunblock <id/username>` — Turn AI ON for target user\n"
             "• `.aichatreset <id/username>` — Reset chat history for target user\n"
-            "• `.setpersona <text>` — Set custom personality prompt"
+            "• `.setpersona <text>` — Set custom personality prompt\n"
+            "• `.aicredits` — Check OpenRouter balance"
         )
         await message.edit_text(cmd_help)
 
@@ -253,13 +350,16 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         # Echo raw without markdown parsing so backticks can't break rendering.
         await message.reply(f"Current persona:\n{persona_text}", parse_mode=None)
 
+    # ------------------------ DM AUTO-REPLY -------------------------- #
+
     @user_client.on_message(
         filters.private
         & ~filters.me
         & ~filters.bot
         & ~filters.service
         & ~filters.command(
-            ["aichat", "aichaton", "aichatoff", "aichatunblock", "aichatreset", "setpersona"],
+            ["aichat", "aichaton", "aichatoff", "aichatunblock", "aichatreset",
+             "setpersona", "aicredits"],
             prefixes=[".", "!", "/"],
         )
     )
@@ -270,7 +370,7 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         if not user_config.get("ai_enabled", True):
             return
 
-        # FIX: guard non-text input (sticker/photo/video in DM used to crash)
+        # Guard non-text input (sticker/photo/video in DM)
         if not message.from_user or not message.text:
             return
 
@@ -290,7 +390,7 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
 
         now = time.time()
 
-        # FIX: per-user rate limit instead of one global timestamp
+        # Per-user rate limit
         rl_key = f"rate_limited_until_{user_id}"
         if now < data.get(rl_key, 0):
             return
@@ -317,6 +417,9 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         )
 
         if retry_after:
+            # 429 = quota exhausted: alert the owner (cooldown-protected).
+            asyncio.create_task(_notify_owner_quota(OPENROUTER_MODEL))
+
             def _set_rl(d):
                 d.setdefault("rate_limited_until", {})[user_id] = time.time() + retry_after
             await update_data(_set_rl)
@@ -327,7 +430,7 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
             print(f"[aichat.py] Reply error: {e}")
             return
 
-        # FIX: error strings ("Currently busy...") must NOT pollute chat history
+        # Error strings ("Currently busy...") must NOT pollute chat history
         if not is_real:
             return
 
