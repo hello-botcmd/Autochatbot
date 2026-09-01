@@ -514,11 +514,6 @@ async def user_input_handler(client, message: Message):
 
 
 async def main():
-    global bot
-
-    # Construct the bot ON the running loop so its dispatcher binds here.
-    bot = Client("DashboardBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
     await bot.start()
     log.info("Dashboard Control Panel Started!")
 
@@ -570,7 +565,7 @@ if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(main())
+        _loop.run_until_complete(main())
     except (KeyboardInterrupt, SystemExit):
         log.info("Interrupted by user.")
     finally:
