@@ -1,10 +1,12 @@
 import asyncio
 import os
 import time
+import traceback
 
 import requests
 from pyrogram import Client, filters
 from pyrogram.types import Message
+from pyrogram.version import __version__ as PYROGRAM_VERSION
 
 from storage import DEFAULT_PERSONA, load_data, update_data
 
@@ -21,13 +23,11 @@ MAX_HISTORY_TURNS = 6
 COOLDOWN_SECONDS = 5
 REQUEST_TIMEOUT = 20
 
-# Owner notification cooldown after a quota-429 (hours).
 QUOTA_NOTIFY_COOLDOWN_HOURS = int(os.getenv("QUOTA_NOTIFY_COOLDOWN_HOURS", "6"))
 
 # --------------------------- CREDITS ----------------------------- #
 
 def _get_openrouter_credits_sync(api_key: str):
-    """Fetch OpenRouter balance. Returns (ok, remaining_or_error)."""
     headers = {"Authorization": f"Bearer {api_key}"}
     resp = requests.get(CREDITS_URL, headers=headers, timeout=15)
     if resp.status_code != 200:
@@ -129,8 +129,6 @@ async def generate_ai_reply(persona: str, history: list, user_message: str, api_
                     print(f"[aichat] OpenRouter {resp.status_code} model={model}: {detail}")
                     if resp.status_code in (400, 404) and model != models[-1]:
                         break  # try fallback model
-                    if resp.status_code >= 500:
-                        continue
                     return (last_user_error, None, False, None)
 
                 data = resp.json()
@@ -157,6 +155,17 @@ async def generate_ai_reply(persona: str, history: list, user_message: str, api_
 
 def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
     owner_id_str = str(owner_id)
+
+    async def _store_error(err: str, kind: str = "error"):
+        try:
+            def _set(d):
+                d.setdefault("last_ai_error", {})
+                d["last_ai_error"]["kind"] = kind
+                d["last_ai_error"]["error"] = err[:900]
+                d["last_ai_error"]["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            await update_data(_set)
+        except Exception as e:
+            print(f"[aichat] error-store failed: {e}")
 
     async def _resolve_target(client: Client, message: Message):
         if message.reply_to_message and message.reply_to_message.from_user:
@@ -216,6 +225,51 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
 
     # -------------------------- COMMANDS ---------------------------- #
 
+    @user_client.on_message(filters.me & filters.command("aiping", prefixes=[".", "!", "/"]))
+    async def aiping_cmd(client: Client, message: Message):
+        """Send .aiping from the account's OWN chat. A pong proves the session
+        is online and the dispatcher is alive — independent of DMs and AI."""
+        await message.edit_text(
+            f"pong ✅ dispatcher alive | pyrogram {PYROGRAM_VERSION}"
+        )
+
+    @user_client.on_message(filters.me & filters.command("aidiag", prefixes=[".", "!", "/"]))
+    async def aidiag_cmd(client: Client, message: Message):
+        """Full self-diagnostics for the 'nothing replies' failure mode."""
+        data = await load_data()
+        uc = data.get("users", {}).get(owner_id_str, {})
+        posts = uc.get("paid_photos") or (
+            [uc["paid_photo"]] if uc.get("paid_photo") else []
+        )
+        now = time.time()
+        active_rl = sum(
+            1 for v in data.get("rate_limited_until", {}).values() if v > now
+        )
+        last_err = data.get("last_ai_error", {})
+
+        lines = [
+            "🩺 AI DIAGNOSTICS",
+            "━━━━━━━━━━━━━━━━",
+            f"pyrogram: {PYROGRAM_VERSION}",
+            f"session account id: {owner_id_str}",
+            f"OPENROUTER_API_KEY: {'set' if api_key else 'MISSING — set it in .env'}",
+            f"model: {OPENROUTER_MODEL} (fallback {OPENROUTER_FALLBACK_MODEL})",
+            f"ai_enabled: {uc.get('ai_enabled', True)}",
+            f"paid posts: {len(posts)} | blocked: {len(data.get('blocked', []))}",
+            f"active 429 locks: {active_rl}",
+            f"unknown-update drops: see [pyrogram] drop lines in console",
+            "━━━━━━━━━━━━━━━━",
+            "Last DM crash/error:",
+            (f"[{last_err.get('ts', '?')}] {last_err.get('kind', '?')}: "
+             f"{last_err.get('error', 'none recorded')}"),
+            "",
+            "If a DM got NO reply and this shows 'none recorded', the DM update "
+            "never reached the handler (offline session / old pyrogram layer).",
+        ]
+        # parse_mode=None: diagnostics text is arbitrary, never let it break
+        # markdown rendering.
+        await message.edit_text("\n".join(lines), parse_mode=None)
+
     @user_client.on_message(filters.me & filters.command("aicredits", prefixes=[".", "!", "/"]))
     async def aicredits_cmd(client: Client, message: Message):
         if not api_key:
@@ -256,6 +310,8 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
             f"• **Paid Posts:** {len(posts)} (rotation)\n\n"
             "📌 **Available Commands:**\n"
             "• `.aichat` — Show this help menu & status\n"
+            "• `.aiping` — Dispatcher alive check (send from own chat)\n"
+            "• `.aidiag` — Full DM-pipeline diagnostics\n"
             "• `.aichaton` — Turn AI ON globally\n"
             "• `.aichatoff` — Turn AI OFF globally\n"
             "• `.aichatoff <id/username>` — Turn AI OFF for target user\n"
@@ -349,30 +405,17 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
 
     # ------------------------ DM AUTO-REPLY -------------------------- #
 
-    @user_client.on_message(
-        filters.private
-        & ~filters.me
-        & ~filters.bot
-        & ~filters.service
-        & ~filters.command(
-            ["aichat", "aichaton", "aichatoff", "aichatunblock", "aichatreset",
-             "setpersona", "aicredits"],
-            prefixes=[".", "!", "/"],
-        )
-    )
-    async def ai_auto_reply(client: Client, message: Message):
+    async def _ai_auto_reply_impl(client: Client, message: Message):
         data = await load_data()
         user_config = data.get("users", {}).get(owner_id_str, {})
 
         if not user_config.get("ai_enabled", True):
             return
 
-        # FIX (AI silent): the old is_send_trigger() check here is REMOVED.
-        # With sentence matching on, it short-circuited AI for ANY message
-        # containing "send"/"star". sendphoto's group -1 handler is the sole
-        # gatekeeper: it raises StopPropagation ONLY when a post was actually
-        # delivered, so this handler either never runs (post sent) or falls
-        # through to a real AI reply (no posts / delivery failed).
+        # NOTE: the old is_send_trigger() check here is intentionally ABSENT.
+        # sendphoto's group -1 handler raises StopPropagation ONLY when a post
+        # was actually delivered; on no-posts / failed delivery we fall through
+        # to a real AI reply instead of silence.
 
         if not message.from_user or not message.text:
             return
@@ -384,8 +427,6 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
 
         now = time.time()
 
-        # Per-user 429 rate limit (reads the nested dict where the write
-        # path stores it — the old flat-key read never matched).
         if now < data.get("rate_limited_until", {}).get(user_id, 0):
             return
 
@@ -420,10 +461,14 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         try:
             await message.reply_text(reply_text)
         except Exception as e:
-            print(f"[aichat.py] Reply error: {e}")
+            err = f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=3)}"
+            print(f"[aichat] Reply send failed: {err}")
+            await _store_error(err, kind="reply_send")
             return
 
         if not is_real:
+            # Error reply was sent, but record WHY so .aidiag can show it.
+            await _store_error(f"error reply: {reply_text}", kind="api_error")
             return
 
         def _append_history(d):
@@ -433,3 +478,25 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
             d["history"][user_id] = h[-(MAX_HISTORY_TURNS * 2):]
 
         await update_data(_append_history)
+
+    @user_client.on_message(
+        filters.private
+        & ~filters.me
+        & ~filters.bot
+        & ~filters.service
+        & ~filters.command(
+            ["aichat", "aichaton", "aichatoff", "aichatunblock", "aichatreset",
+             "setpersona", "aicredits", "aiping", "aidiag"],
+            prefixes=[".", "!", "/"],
+        )
+    )
+    async def ai_auto_reply(client: Client, message: Message):
+        # HARD GUARD: an exception escaping this group-0 handler kills the
+        # reply AND prints a dispatcher log easy to miss. Every crash is
+        # stored in data.json so .aidiag can display it later.
+        try:
+            await _ai_auto_reply_impl(client, message)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=5)}"
+            print(f"[aichat] DM handler CRASH: {err}")
+            await _store_error(err, kind="crash")
