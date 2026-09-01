@@ -369,6 +369,7 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         await message.reply(f"Current persona:\n{persona_text}", parse_mode=None)
 
     # ------------------------ DM AUTO-REPLY -------------------------- #
+    # ------------------------ DM AUTO-REPLY -------------------------- #
 
     @user_client.on_message(
         filters.private
@@ -393,6 +394,8 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
             return
 
         user_id = str(message.from_user.id)
+        log.debug("AI handler fired: owner=%s from=%s text=%r",
+                  owner_id_str, user_id, message.text[:40])
 
         if user_id in data.get("blocked", []):
             return
@@ -404,9 +407,13 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
             return
 
         # Per-user cooldown: check + set atomically so two near-simultaneous
-        # DMs can't both pass the check.
+        # DMs can't both pass the check. (Storage migrates legacy flat
+        # entries, so owner_id_str is always a dict here.)
         def _check_cooldown(d):
             per_owner = d.setdefault("last_msg_time", {}).setdefault(owner_id_str, {})
+            if not isinstance(per_owner, dict):
+                per_owner = {}
+                d["last_msg_time"][owner_id_str] = per_owner
             if now - per_owner.get(user_id, 0) < COOLDOWN_SECONDS:
                 return False
             per_owner[user_id] = now
@@ -416,7 +423,10 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
             return
 
         # History is per userbot account, per sender.
-        chat_history = data.get("history", {}).get(owner_id_str, {}).get(user_id, [])
+        per_owner_history = data.get("history", {}).get(owner_id_str, {})
+        if not isinstance(per_owner_history, dict):
+            per_owner_history = {}
+        chat_history = per_owner_history.get(user_id, [])
         persona = data.get("persona", DEFAULT_PERSONA)
 
         try:
@@ -448,6 +458,9 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
 
         def _append_history(d):
             per_owner = d.setdefault("history", {}).setdefault(owner_id_str, {})
+            if not isinstance(per_owner, dict):
+                per_owner = {}
+                d["history"][owner_id_str] = per_owner
             h = per_owner.setdefault(user_id, [])
             h.append({"role": "user", "text": message.text})
             h.append({"role": "assistant", "text": reply_text})
