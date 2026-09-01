@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import time
@@ -8,7 +9,8 @@ from pyrogram.types import Message
 
 # --------------------------- CONFIG --------------------------- #
 
-OPENROUTER_MODEL = "openai/gpt-chat-latest"
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-chat-latest")
+OPENROUTER_FALLBACK_MODEL = os.getenv("OPENROUTER_FALLBACK_MODEL", "openai/gpt-4o-mini")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 DEFAULT_PERSONA = (
@@ -57,7 +59,40 @@ def save_data(data: dict) -> None:
 
 # --------------------------- AI CALL ----------------------------- #
 
-def generate_ai_reply(persona: str, history: list, user_message: str, api_key: str) -> tuple:
+def _openrouter_error_text(resp: requests.Response) -> str:
+    try:
+        payload = resp.json()
+        err = payload.get("error")
+        if isinstance(err, dict):
+            return str(err.get("message") or err)
+        if isinstance(err, str):
+            return err
+        if payload.get("message"):
+            return str(payload["message"])
+    except Exception:
+        pass
+    body = (resp.text or "").strip().replace("\n", " ")
+    return body[:300] if body else f"HTTP {resp.status_code}"
+
+
+def _friendly_http_error(status: int, detail: str) -> str:
+    detail_l = (detail or "").lower()
+    if status in (401, 403) or "auth" in detail_l or "api key" in detail_l:
+        return "AI API key is invalid or missing. Check OPENROUTER_API_KEY. 🙏"
+    if status == 402 or "credit" in detail_l or "quota" in detail_l or "balance" in detail_l:
+        return "OpenRouter credits are empty. Top up and try again. 🙏"
+    if status == 404 or "not found" in detail_l or "no such model" in detail_l:
+        return f"AI model is unavailable (`{OPENROUTER_MODEL}`). 🙏"
+    if status == 400:
+        return f"AI request was rejected: {detail[:180]} 🙏"
+    return f"Currently busy ({status}), will respond in a bit! 🙏"
+
+
+def _post_openrouter(payload: dict, headers: dict) -> requests.Response:
+    return requests.post(OPENROUTER_URL, json=payload, headers=headers, timeout=45)
+
+
+async def generate_ai_reply(persona: str, history: list, user_message: str, api_key: str) -> tuple:
     if not api_key:
         return ("AI is not configured. Please set OPENROUTER_API_KEY first. 🙏", None)
 
@@ -67,13 +102,6 @@ def generate_ai_reply(persona: str, history: list, user_message: str, api_key: s
         messages.append({"role": role, "content": turn["text"]})
     messages.append({"role": "user", "content": user_message})
 
-    payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": messages,
-        "max_tokens": 200,
-        "temperature": 0.9,
-    }
-
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -81,36 +109,64 @@ def generate_ai_reply(persona: str, history: list, user_message: str, api_key: s
         "X-Title": "RAUSHAN Userbot",
     }
 
-    last_error = None
-    for attempt in range(2):
-        try:
-            resp = requests.post(OPENROUTER_URL, json=payload, headers=headers, timeout=45)
+    models = [OPENROUTER_MODEL]
+    if OPENROUTER_FALLBACK_MODEL and OPENROUTER_FALLBACK_MODEL not in models:
+        models.append(OPENROUTER_FALLBACK_MODEL)
 
-            if resp.status_code == 429:
-                retry_after = 60
-                try:
-                    retry_after = int(resp.headers.get("Retry-After", retry_after))
-                except (TypeError, ValueError):
-                    pass
-                return (
-                    "Quota limit reached, please try again in a bit! 🙏",
-                    retry_after,
-                )
+    last_user_error = "Currently busy, will respond in a bit! 🙏"
 
-            resp.raise_for_status()
-            data = resp.json()
-            return (data["choices"][0]["message"]["content"].strip(), None)
-        except requests.exceptions.Timeout as e:
-            last_error = e
-            continue
-        except requests.exceptions.HTTPError as e:
-            return ("Currently busy, will respond in a bit! 🙏", None)
-        except requests.exceptions.RequestException as e:
-            return ("Currently busy, will respond in a bit! 🙏", None)
-        except (KeyError, IndexError) as e:
-            return ("Could not understand that, please try again. 🙏", None)
+    for model in models:
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": 200,
+            "temperature": 0.9,
+        }
+        for attempt in range(2):
+            try:
+                resp = await asyncio.to_thread(_post_openrouter, payload, headers)
 
-    return ("Service is slow right now, please resend your message. 🙏", None)
+                if resp.status_code == 429:
+                    retry_after = 60
+                    try:
+                        retry_after = int(resp.headers.get("Retry-After", retry_after))
+                    except (TypeError, ValueError):
+                        pass
+                    print(f"[aichat] 429 from OpenRouter model={model}")
+                    return (
+                        "Quota limit reached, please try again in a bit! 🙏",
+                        retry_after,
+                    )
+
+                if resp.status_code >= 400:
+                    detail = _openrouter_error_text(resp)
+                    print(f"[aichat] OpenRouter {resp.status_code} model={model}: {detail}")
+                    last_user_error = _friendly_http_error(resp.status_code, detail)
+                    # Try fallback model on model/request errors.
+                    if resp.status_code in (400, 404) and model != models[-1]:
+                        break
+                    if resp.status_code >= 500:
+                        continue
+                    return (last_user_error, None)
+
+                data = resp.json()
+                text = data["choices"][0]["message"]["content"].strip()
+                if model != OPENROUTER_MODEL:
+                    print(f"[aichat] fallback model used: {model}")
+                return (text, None)
+            except requests.exceptions.Timeout:
+                print(f"[aichat] timeout model={model} attempt={attempt + 1}")
+                last_user_error = "Service is slow right now, please resend your message. 🙏"
+                continue
+            except requests.exceptions.RequestException as e:
+                print(f"[aichat] request error model={model}: {e}")
+                last_user_error = "Currently busy, will respond in a bit! 🙏"
+                continue
+            except (KeyError, IndexError, TypeError, ValueError) as e:
+                print(f"[aichat] bad OpenRouter payload: {e}")
+                return ("Could not understand that, please try again. 🙏", None)
+
+    return (last_user_error, None)
 
 
 # ---------------------- DYNAMIC REGISTER FUNCTION ------------------ #
@@ -291,7 +347,7 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         except Exception:
             pass
 
-        reply_text, retry_after = generate_ai_reply(persona, chat_history, message.text, api_key)
+        reply_text, retry_after = await generate_ai_reply(persona, chat_history, message.text, api_key)
 
         if retry_after:
             data["rate_limited_until"] = time.time() + retry_after
