@@ -49,6 +49,10 @@ def apply_pyrogram_peer_patch() -> None:
         orig_handle_packet = Session.handle_packet
 
         async def handle_packet_safe(self, packet):
+            # FIX (UnboundLocalError): the assignment below made Python treat
+            # this name as a local. It must be declared global INSIDE this
+            # nested function, not only in the enclosing one.
+            global _LOGGED_UNKNOWN_CONSTRUCTOR
             try:
                 return await orig_handle_packet(self, packet)
             except ValueError as e:
