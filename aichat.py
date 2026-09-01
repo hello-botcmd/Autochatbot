@@ -75,19 +75,6 @@ def _openrouter_error_text(resp: requests.Response) -> str:
     return body[:300] if body else f"HTTP {resp.status_code}"
 
 
-def _friendly_http_error(status: int, detail: str) -> str:
-    detail_l = (detail or "").lower()
-    if status in (401, 403) or "auth" in detail_l or "api key" in detail_l:
-        return "AI API key is invalid or missing. Check OPENROUTER_API_KEY. 🙏"
-    if status == 402 or "credit" in detail_l or "quota" in detail_l or "balance" in detail_l:
-        return "OpenRouter credits are empty. Top up and try again. 🙏"
-    if status == 404 or "not found" in detail_l or "no such model" in detail_l:
-        return f"AI model is unavailable (`{OPENROUTER_MODEL}`). 🙏"
-    if status == 400:
-        return f"AI request was rejected: {detail[:180]} 🙏"
-    return f"Currently busy ({status}), will respond in a bit! 🙏"
-
-
 def _post_openrouter(payload: dict, headers: dict) -> requests.Response:
     return requests.post(OPENROUTER_URL, json=payload, headers=headers, timeout=45)
 
@@ -141,7 +128,7 @@ async def generate_ai_reply(persona: str, history: list, user_message: str, api_
                 if resp.status_code >= 400:
                     detail = _openrouter_error_text(resp)
                     print(f"[aichat] OpenRouter {resp.status_code} model={model}: {detail}")
-                    last_user_error = _friendly_http_error(resp.status_code, detail)
+                    last_user_error = "Currently busy, will respond in a bit! 🙏"
                     # Try fallback model on model/request errors.
                     if resp.status_code in (400, 404) and model != models[-1]:
                         break
@@ -322,9 +309,9 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
 
         # Paid-photo trigger words skip AI so only the saved post is sent.
         try:
-            from sendphoto import account_has_paid_post, is_send_trigger
+            from sendphoto import is_send_trigger
 
-            if is_send_trigger(message.text) and account_has_paid_post(owner_id_str):
+            if is_send_trigger(message.text):
                 return
         except Exception:
             pass
