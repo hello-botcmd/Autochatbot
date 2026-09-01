@@ -2,15 +2,40 @@
 
 1. Newer channel IDs don't crash update handling (MIN/MAX peer-id constants).
 2. Unknown TL constructors (Telegram layers newer than the installed schema)
-   are dropped with a one-time log line instead of traceback spam.
+   are dropped instead of traceback spam.
 3. handle_updates guards only swallow known peer-resolution failures.
+4. NEW: unknown-constructor drops are COUNTED. If the count climbs fast it
+   warns that the installed Pyrogram schema is too old for Telegram's current
+   layer — the classic "nothing replies, no errors" failure mode. The fix is
+   a current-layer fork:  pip install -U pyrofork  (drop-in, same `pyrogram`
+   import; all code in this repo works unchanged).
 """
 
-_LOGGED_UNKNOWN_CONSTRUCTOR = False
+import os
+
+_UNKNOWN_CONSTRUCTOR_DROPS = 0
+_PEER_GUARD_DROPS = 0
+
+_WARN_EVERY = int(os.getenv("PYRO_PATCH_WARN_EVERY", "50"))
+
+
+def _warn_unknown(count: int) -> None:
+    if count == 1 or count % _WARN_EVERY == 0:
+        print(
+            f"[pyrogram] dropped {count} update(s) with unknown TL constructor "
+            f"(Telegram layer newer than installed schema)."
+        )
+        if count >= _WARN_EVERY * 10:
+            print(
+                "[pyrogram] ⚠️ DROP COUNT IS CLIMBING — your Pyrogram schema is too "
+                "old to decode most updates, so handlers rarely/never fire "
+                "(AI replies and triggers look dead with NO errors). Fix: "
+                "pip install -U pyrofork"
+            )
 
 
 def apply_pyrogram_peer_patch() -> None:
-    global _LOGGED_UNKNOWN_CONSTRUCTOR
+    global _UNKNOWN_CONSTRUCTOR_DROPS, _PEER_GUARD_DROPS
 
     try:
         from pyrogram import utils as pyro_utils
@@ -40,8 +65,6 @@ def apply_pyrogram_peer_patch() -> None:
             setattr(pyro_utils, name, value)
 
     # ---------------- 2. Unknown TL constructors ---------------- #
-    # Fires BEFORE deserialization (Session.handle_packet / mtproto.unpack),
-    # which is where "The server sent an unknown constructor" originates.
 
     try:
         from pyrogram.session import Session
@@ -49,30 +72,20 @@ def apply_pyrogram_peer_patch() -> None:
         orig_handle_packet = Session.handle_packet
 
         async def handle_packet_safe(self, packet):
-            # FIX (UnboundLocalError): the assignment below made Python treat
-            # this name as a local. It must be declared global INSIDE this
-            # nested function, not only in the enclosing one.
-            global _LOGGED_UNKNOWN_CONSTRUCTOR
+            # Declared global INSIDE this nested function, else the increments
+            # below make the names local -> UnboundLocalError.
+            global _UNKNOWN_CONSTRUCTOR_DROPS
             try:
                 return await orig_handle_packet(self, packet)
             except ValueError as e:
                 if "unknown constructor" in str(e):
-                    if not _LOGGED_UNKNOWN_CONSTRUCTOR:
-                        print(
-                            "[pyrogram] dropped update with unknown TL constructor "
-                            "(Telegram layer newer than installed schema). "
-                            "Further occurrences suppressed."
-                        )
-                        _LOGGED_UNKNOWN_CONSTRUCTOR = True
+                    _UNKNOWN_CONSTRUCTOR_DROPS += 1
+                    _warn_unknown(_UNKNOWN_CONSTRUCTOR_DROPS)
                     return
                 raise
             except KeyError as e:
-                if not _LOGGED_UNKNOWN_CONSTRUCTOR:
-                    print(
-                        f"[pyrogram] dropped update with unknown constructor id {e}. "
-                        "Further occurrences suppressed."
-                    )
-                    _LOGGED_UNKNOWN_CONSTRUCTOR = True
+                _UNKNOWN_CONSTRUCTOR_DROPS += 1
+                _warn_unknown(_UNKNOWN_CONSTRUCTOR_DROPS)
                 return
 
         Session.handle_packet = handle_packet_safe
@@ -84,18 +97,23 @@ def apply_pyrogram_peer_patch() -> None:
     orig_handle_updates = Client.handle_updates
 
     async def handle_updates_safe(self, updates):
-        # Only guard known peer-resolution failures; everything else
-        # propagates so real bugs aren't silently lost.
+        global _PEER_GUARD_DROPS
         try:
             return await orig_handle_updates(self, updates)
         except ValueError as e:
             if "Peer id invalid" in str(e):
-                print(f"[pyrogram] ignored invalid peer: {e}")
+                _PEER_GUARD_DROPS += 1
+                if _PEER_GUARD_DROPS == 1 or _PEER_GUARD_DROPS % _WARN_EVERY == 0:
+                    print(f"[pyrogram] peer drops={_PEER_GUARD_DROPS}: {e} "
+                          f"(session hasn't cached this peer yet)")
                 return None
             raise
         except KeyError as e:
-            print(f"[pyrogram] ignored missing peer: {e}")
+            _PEER_GUARD_DROPS += 1
+            if _PEER_GUARD_DROPS == 1 or _PEER_GUARD_DROPS % _WARN_EVERY == 0:
+                print(f"[pyrogram] peer drops={_PEER_GUARD_DROPS}: missing peer {e}")
             return None
 
     Client.handle_updates = handle_updates_safe
-    print("[pyro_patch] applied peer-id + constructor + handle_updates guards")
+    print("[pyro_patch] applied peer-id + constructor + handle_updates guards "
+          "(drop counting enabled)")
