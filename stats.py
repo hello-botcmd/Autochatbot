@@ -1,8 +1,10 @@
 import platform
 import time
+
 import psutil
 
 START_TIME = time.time()
+
 
 def get_formatted_uptime() -> str:
     uptime_seconds = int(time.time() - START_TIME)
