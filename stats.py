@@ -4,9 +4,7 @@ import time
 import psutil
 
 START_TIME = time.time()
-
-# Prime the CPU counter. Without this, the first cpu_percent(interval=None)
-# call returns 0.0 because psutil has no previous sample to diff against.
+# Prime the CPU baseline so the first stats read isn't a meaningless 0%.
 psutil.cpu_percent(interval=None)
 
 
