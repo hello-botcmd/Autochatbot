@@ -131,6 +131,7 @@ async def save_post_from_link(user_client: Client, owner_id: str, link: str):
             "message_id": msg_id,
             "link": link.strip(),
             "title": title,
+            "username": getattr(chat, "username", None),
         }
         save_data(data)
 
@@ -150,12 +151,40 @@ async def save_post_from_link(user_client: Client, owner_id: str, link: str):
         )
 
 
+async def _resolve_source_chat(client: Client, post: dict):
+    """Re-resolve the saved source so the peer exists in this in-memory session."""
+    username = post.get("username")
+    if username:
+        try:
+            chat = await client.get_chat(username)
+            return chat.id
+        except Exception as e:
+            print(f"[sendphoto] get_chat(@{username}) failed: {e}")
+
+    link = post.get("link") or ""
+    chat_ref, _ = parse_post_link(link)
+    if chat_ref is not None:
+        try:
+            chat = await client.get_chat(chat_ref)
+            return chat.id
+        except Exception as e:
+            print(f"[sendphoto] get_chat(link) failed: {e}")
+
+    chat_id = post.get("chat_id")
+    try:
+        chat = await client.get_chat(int(chat_id))
+        return chat.id
+    except Exception as e:
+        print(f"[sendphoto] get_chat({chat_id}) failed: {e}")
+        return chat_id
+
+
 async def forward_saved_post(client: Client, owner_id: str, target_chat_id: int) -> bool:
     post = get_paid_post(owner_id)
     if not post:
         return False
 
-    from_chat_id = post["chat_id"]
+    from_chat_id = await _resolve_source_chat(client, post)
     message_id = post["message_id"]
 
     try:
