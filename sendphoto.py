@@ -1,19 +1,12 @@
 import re
 
-from pyrogram import Client, filters
+from pyrogram import Client, StopPropagation, filters
 from pyrogram.types import Message
 
+from storage import load_data, update_data
+
 # Hardcoded DM trigger words. Matched case-insensitively as the full message.
-PHOTO_TRIGGERS = {
-    "send",
-    ".send",
-    "!send",
-    "/send",
-    "star",
-    ".star",
-    "!star",
-    "/star",
-}
+PHOTO_TRIGGERS = {"send", ".send", "!send", "/send", "star", ".star", "!star", "/star"}
 
 _RESERVED_PUBLIC_PATHS = {"c", "s", "addstickers", "joinchat", "share", "boost", "proxy"}
 
@@ -27,9 +20,9 @@ def is_send_trigger(text: str) -> bool:
 def parse_post_link(link: str):
     """
     Supports:
-      https://t.me/channelusername/123     -> public channel
-      https://t.me/c/1234567890/123         -> private channel (internal id)
-      https://telegram.me/...               -> same forms
+      https://t.me/channelusername/123  -> public channel
+      https://t.me/c/1234567890/123     -> private channel (internal id)
+      https://telegram.me/...           -> same forms
     Returns (chat_ref, message_id) or (None, None).
     chat_ref is a username string or a numeric -100... chat id.
     """
@@ -40,10 +33,7 @@ def parse_post_link(link: str):
 
     m = re.search(r"(?:t(?:elegram)?\.me)/c/(\d+)/(\d+)", link)
     if m:
-        internal_id = int(m.group(1))
-        msg_id = int(m.group(2))
-        chat_ref = int(f"-100{internal_id}")
-        return chat_ref, msg_id
+        return int(f"-100{m.group(1)}"), int(m.group(2))
 
     m = re.search(r"(?:t(?:elegram)?\.me)/([A-Za-z0-9_]+)/(\d+)", link)
     if m:
@@ -55,27 +45,25 @@ def parse_post_link(link: str):
     return None, None
 
 
-def get_paid_post(owner_id: str):
-    from aichat import load_data
+async def get_paid_post(owner_id: str):
+    data = await load_data()
+    return data.get("users", {}).get(str(owner_id), {}).get("paid_photo")
 
-    return load_data().get("users", {}).get(str(owner_id), {}).get("paid_photo")
 
-
-def account_has_paid_post(owner_id: str) -> bool:
-    post = get_paid_post(owner_id)
+async def account_has_paid_post(owner_id: str) -> bool:
+    post = await get_paid_post(owner_id)
     return bool(post and post.get("chat_id") and post.get("message_id"))
 
 
-def clear_paid_post(owner_id: str) -> bool:
-    from aichat import load_data, save_data
+async def clear_paid_post(owner_id: str) -> bool:
+    def _clear(d):
+        user = d.get("users", {}).get(str(owner_id))
+        if not user or "paid_photo" not in user:
+            return False
+        user.pop("paid_photo", None)
+        return True
 
-    data = load_data()
-    user = data.get("users", {}).get(str(owner_id))
-    if not user or "paid_photo" not in user:
-        return False
-    user.pop("paid_photo", None)
-    save_data(data)
-    return True
+    return bool(await update_data(_clear))
 
 
 def format_paid_post(post: dict) -> str:
@@ -83,23 +71,18 @@ def format_paid_post(post: dict) -> str:
         return "Not set ❌"
     title = post.get("title") or "Unknown"
     link = post.get("link") or ""
-    chat_id = post.get("chat_id")
-    msg_id = post.get("message_id")
     lines = [f"**{title}**"]
     if link:
         lines.append(f"• **Link:** `{link}`")
-    lines.append(f"• **Chat ID:** `{chat_id}`")
-    lines.append(f"• **Message ID:** `{msg_id}`")
+    lines.append(f"• **Chat ID:** `{post.get('chat_id')}`")
+    lines.append(f"• **Message ID:** `{post.get('message_id')}`")
     return "\n".join(lines)
 
 
 async def save_post_from_link(user_client: Client, owner_id: str, link: str):
     """Resolve a t.me post link through the connected userbot and persist it.
-
     Returns (ok: bool, message: str).
     """
-    from aichat import load_data, save_data
-
     chat_ref, msg_id = parse_post_link(link)
     if chat_ref is None:
         return False, (
@@ -124,16 +107,16 @@ async def save_post_from_link(user_client: Client, owner_id: str, link: str):
             or str(chat.id)
         )
 
-        data = load_data()
-        user = data.setdefault("users", {}).setdefault(str(owner_id), {})
-        user["paid_photo"] = {
-            "chat_id": chat.id,
-            "message_id": msg_id,
-            "link": link.strip(),
-            "title": title,
-            "username": getattr(chat, "username", None),
-        }
-        save_data(data)
+        def _save(d):
+            d.setdefault("users", {}).setdefault(str(owner_id), {})["paid_photo"] = {
+                "chat_id": chat.id,
+                "message_id": msg_id,
+                "link": link.strip(),
+                "title": title,
+                "username": getattr(chat, "username", None),
+            }
+
+        await update_data(_save)
 
         return True, (
             f"✅ **Post saved for forwarding**\n\n"
@@ -141,7 +124,7 @@ async def save_post_from_link(user_client: Client, owner_id: str, link: str):
             f"• **Chat ID:** `{chat.id}`\n"
             f"• **Message ID:** `{msg_id}`\n"
             f"• **Link:** `{link.strip()}`\n\n"
-            "In DMs, `send` / `.send` / `.star` will forward this post. "
+            "In DMs, `send` / `.send` / `star` / `.star` will forward this post. "
             "AI will not reply on those trigger words."
         )
     except Exception as e:
@@ -180,7 +163,7 @@ async def _resolve_source_chat(client: Client, post: dict):
 
 
 async def forward_saved_post(client: Client, owner_id: str, target_chat_id: int) -> bool:
-    post = get_paid_post(owner_id)
+    post = await get_paid_post(owner_id)
     if not post:
         return False
 
@@ -212,17 +195,15 @@ def register_sendphoto_handler(user_client: Client, owner_id: str):
     owner_id_str = str(owner_id)
 
     @user_client.on_message(
-        filters.private
-        & ~filters.me
-        & ~filters.bot
-        & ~filters.service
+        filters.private & ~filters.me & ~filters.bot & ~filters.service,
+        group=-1,  # FIX: runs BEFORE aichat's group-0 handler, else it never fires
     )
     async def paid_photo_trigger(client: Client, message: Message):
         if not message.text or not is_send_trigger(message.text):
             return
 
-        if not account_has_paid_post(owner_id_str):
-            return
+        if not await account_has_paid_post(owner_id_str):
+            return  # no post set -> fall through, AI auto-reply handles it
 
         try:
             await client.send_chat_action(message.chat.id, "typing")
@@ -232,3 +213,6 @@ def register_sendphoto_handler(user_client: Client, owner_id: str):
         ok = await forward_saved_post(client, owner_id_str, message.chat.id)
         if not ok:
             print(f"[sendphoto] could not share saved post for account {owner_id_str}")
+
+        # Post delivered (or attempted) — stop AI from also replying.
+        raise StopPropagation
