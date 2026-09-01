@@ -15,13 +15,12 @@ DEFAULT_PERSONA = (
 )
 
 _default_data = {
-    "enabled": True,
     "persona": DEFAULT_PERSONA,
     "users": {},
-    "history": {},
-    "last_msg_time": {},
-    "rate_limited_until": {},  # per-user: {user_id: unix_ts}
-    "blocked": [],
+    "history": {},             # {owner_id: {sender_id: [turns]}}   per account
+    "last_msg_time": {},       # {owner_id: {sender_id: unix_ts}}  per account
+    "rate_limited_until": {},  # {sender_id: unix_ts}              global
+    "blocked": [],             # global blocked senders
 }
 
 # Single asyncio lock: every read-modify-write runs under it, so concurrent
@@ -72,7 +71,7 @@ def _read_sync() -> dict:
 async def load_data() -> dict:
     """Load data for read-only checks. For mutations use update_data()."""
     async with _lock:
-        return _read_sync()
+        return await asyncio.to_thread(_read_sync)
 
 
 async def save_data(data: dict) -> None:
@@ -88,7 +87,7 @@ async def update_data(mutation):
     The mutated dict is persisted before the lock is released.
     """
     async with _lock:
-        data = _read_sync()
+        data = await asyncio.to_thread(_read_sync)
         result = mutation(data)
         await asyncio.to_thread(_write_sync, data)
         return result
