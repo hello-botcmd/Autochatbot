@@ -242,7 +242,6 @@ async def forward_saved_post(client: Client, owner_id: str, target_chat_id: int)
         log.warning("copy failed: %s", copy_err)
         return False
 
-
 def register_sendphoto_handler(user_client: Client, owner_id: str):
     owner_id_str = str(owner_id)
 
@@ -256,7 +255,14 @@ def register_sendphoto_handler(user_client: Client, owner_id: str):
 
         posts = await get_paid_posts(owner_id_str)
         if not posts:
+            log.debug("[sendphoto] trigger but no posts set, falling through to AI: owner=%s",
+                      owner_id_str)
             return  # no post set -> fall through, AI auto-reply handles it
+
+        log.info("[sendphoto] trigger: owner=%s from=%s posts=%s text=%r",
+                 owner_id_str,
+                 message.from_user.id if message.from_user else "?",
+                 len(posts), message.text[:40])
 
         try:
             await client.send_chat_action(message.chat.id, "typing")
@@ -264,8 +270,10 @@ def register_sendphoto_handler(user_client: Client, owner_id: str):
             pass
 
         ok = await forward_saved_post(client, owner_id_str, message.chat.id)
-        if not ok:
-            log.warning("could not share saved post for account %s", owner_id_str)
+        if ok:
+            log.info("[sendphoto] post sent: owner=%s to=%s", owner_id_str, message.chat.id)
+        else:
+            log.warning("[sendphoto] could not share saved post for account %s", owner_id_str)
             # Never leave the user with silence: the copy failed.
             try:
                 await message.reply_text(
