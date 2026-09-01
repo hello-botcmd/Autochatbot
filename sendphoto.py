@@ -1,3 +1,4 @@
+import logging
 import re
 
 from pyrogram import Client, StopPropagation, filters
@@ -5,8 +6,16 @@ from pyrogram.types import Message
 
 from storage import load_data, update_data
 
-# Hardcoded DM trigger words. Matched case-insensitively as the full message.
-PHOTO_TRIGGERS = {"send", ".send", "!send", "/send", "star", ".star", "!star", "/star"}
+log = logging.getLogger(__name__)
+
+# Trigger words are matched ANYWHERE inside a sentence as standalone words,
+# case-insensitively. "please send it" and "bro star" match;
+# "sendphoto", "resend", "sender" do NOT (word-boundary regex).
+TRIGGER_WORDS = ("send", "star")
+_TRIGGER_RE = re.compile(
+    r"\b(?:[.!/])?(?:" + "|".join(TRIGGER_WORDS) + r")\b",
+    re.IGNORECASE,
+)
 
 _RESERVED_PUBLIC_PATHS = {"c", "s", "addstickers", "joinchat", "share", "boost", "proxy"}
 
@@ -14,7 +23,7 @@ _RESERVED_PUBLIC_PATHS = {"c", "s", "addstickers", "joinchat", "share", "boost",
 def is_send_trigger(text: str) -> bool:
     if not text:
         return False
-    return text.strip().lower() in PHOTO_TRIGGERS
+    return bool(_TRIGGER_RE.search(text))
 
 
 def parse_post_link(link: str):
@@ -45,43 +54,63 @@ def parse_post_link(link: str):
     return None, None
 
 
-async def get_paid_post(owner_id: str):
+def _migrate(user: dict) -> None:
+    """Upgrade a legacy single 'paid_photo' entry to the 'paid_posts' list.
+    Call inside update_data (lock held) or on a loaded read-only copy."""
+    if "paid_posts" not in user:
+        posts = []
+        legacy = user.pop("paid_photo", None)
+        if legacy and legacy.get("chat_id") and legacy.get("message_id"):
+            posts.append(legacy)
+        user["paid_posts"] = posts
+    user.setdefault("paid_post_idx", 0)
+
+
+async def get_paid_posts(owner_id: str) -> list:
     data = await load_data()
-    return data.get("users", {}).get(str(owner_id), {}).get("paid_photo")
+    user = data.get("users", {}).get(str(owner_id), {})
+    _migrate(user)
+    return user.get("paid_posts", [])
 
 
 async def account_has_paid_post(owner_id: str) -> bool:
-    post = await get_paid_post(owner_id)
-    return bool(post and post.get("chat_id") and post.get("message_id"))
+    return bool(await get_paid_posts(owner_id))
 
 
 async def clear_paid_post(owner_id: str) -> bool:
     def _clear(d):
         user = d.get("users", {}).get(str(owner_id))
-        if not user or "paid_photo" not in user:
+        if not user:
             return False
+        _migrate(user)
+        had = bool(user.get("paid_posts"))
+        user["paid_posts"] = []
+        user["paid_post_idx"] = 0
         user.pop("paid_photo", None)
-        return True
+        return had
 
     return bool(await update_data(_clear))
 
 
-def format_paid_post(post: dict) -> str:
-    if not post:
+def format_paid_posts(posts: list) -> str:
+    if not posts:
         return "Not set ❌"
-    title = post.get("title") or "Unknown"
-    link = post.get("link") or ""
-    lines = [f"**{title}**"]
-    if link:
-        lines.append(f"• **Link:** `{link}`")
-    lines.append(f"• **Chat ID:** `{post.get('chat_id')}`")
-    lines.append(f"• **Message ID:** `{post.get('message_id')}`")
+    lines = []
+    for i, post in enumerate(posts, 1):
+        title = post.get("title") or "Unknown"
+        lines.append(f"**{i}. {title}**")
+        if post.get("link"):
+            lines.append(f"   • **Link:** `{post['link']}`")
+        lines.append(
+            f"   • **Chat ID:** `{post.get('chat_id')}` · "
+            f"**Msg:** `{post.get('message_id')}`"
+        )
     return "\n".join(lines)
 
 
 async def save_post_from_link(user_client: Client, owner_id: str, link: str):
-    """Resolve a t.me post link through the connected userbot and persist it.
-    Returns (ok: bool, message: str).
+    """Resolve a t.me post link through the connected userbot and APPEND it
+    to the account's rotation list. Returns (ok: bool, message: str).
     """
     chat_ref, msg_id = parse_post_link(link)
     if chat_ref is None:
@@ -108,24 +137,38 @@ async def save_post_from_link(user_client: Client, owner_id: str, link: str):
         )
 
         def _save(d):
-            d.setdefault("users", {}).setdefault(str(owner_id), {})["paid_photo"] = {
+            user = d.setdefault("users", {}).setdefault(str(owner_id), {})
+            _migrate(user)
+            posts = user.setdefault("paid_posts", [])
+
+            # Skip exact duplicates (same chat + message id).
+            posts = [
+                p for p in posts
+                if not (p.get("chat_id") == chat.id and p.get("message_id") == msg_id)
+            ]
+            posts.append({
                 "chat_id": chat.id,
                 "message_id": msg_id,
                 "link": link.strip(),
                 "title": title,
                 "username": getattr(chat, "username", None),
-            }
+            })
+            user["paid_posts"] = posts
+            # Keep rotation index in range after a possible re-add.
+            user["paid_post_idx"] = int(user.get("paid_post_idx", 0)) % len(posts)
+            return len(posts)
 
-        await update_data(_save)
+        count = await update_data(_save)
 
         return True, (
-            f"✅ **Post saved for forwarding**\n\n"
+            f"✅ **Post #{count} saved to rotation**\n\n"
             f"• **Channel:** `{title}`\n"
             f"• **Chat ID:** `{chat.id}`\n"
             f"• **Message ID:** `{msg_id}`\n"
             f"• **Link:** `{link.strip()}`\n\n"
-            "In DMs, `send` / `.send` / `star` / `.star` will forward this post. "
-            "AI will not reply on those trigger words."
+            "Each `send` / `star` trigger in DMs sends the **next** post "
+            "in the list (round-robin), with no forward header. AI will "
+            "not reply to those trigger words."
         )
     except Exception as e:
         return False, (
@@ -142,7 +185,7 @@ async def _resolve_source_chat(client: Client, post: dict):
             chat = await client.get_chat(username)
             return chat.id
         except Exception as e:
-            print(f"[sendphoto] get_chat(@{username}) failed: {e}")
+            log.warning("get_chat(@%s) failed: %s", username, e)
 
     link = post.get("link") or ""
     chat_ref, _ = parse_post_link(link)
@@ -151,19 +194,37 @@ async def _resolve_source_chat(client: Client, post: dict):
             chat = await client.get_chat(chat_ref)
             return chat.id
         except Exception as e:
-            print(f"[sendphoto] get_chat(link) failed: {e}")
+            log.warning("get_chat(link) failed: %s", e)
 
     chat_id = post.get("chat_id")
     try:
         chat = await client.get_chat(int(chat_id))
         return chat.id
     except Exception as e:
-        print(f"[sendphoto] get_chat({chat_id}) failed: {e}")
+        log.warning("get_chat(%s) failed: %s", chat_id, e)
         return chat_id
 
 
 async def forward_saved_post(client: Client, owner_id: str, target_chat_id: int) -> bool:
-    post = await get_paid_post(owner_id)
+    """Send the NEXT saved post (round-robin) to target_chat_id.
+
+    Uses copy_message, NOT forward_messages, so the message arrives as a
+    clean copy — no "Forwarded from <channel>" header. The rotation index
+    is advanced atomically under the storage lock.
+    """
+    def _pick_next(d):
+        user = d.get("users", {}).get(str(owner_id))
+        if not user:
+            return None
+        _migrate(user)
+        posts = user.get("paid_posts") or []
+        if not posts:
+            return None
+        idx = int(user.get("paid_post_idx", 0)) % len(posts)
+        user["paid_post_idx"] = (idx + 1) % len(posts)  # advance rotation
+        return posts[idx]
+
+    post = await update_data(_pick_next)
     if not post:
         return False
 
@@ -171,24 +232,15 @@ async def forward_saved_post(client: Client, owner_id: str, target_chat_id: int)
     message_id = post["message_id"]
 
     try:
-        await client.forward_messages(
+        await client.copy_message(
             chat_id=target_chat_id,
             from_chat_id=from_chat_id,
-            message_ids=message_id,
+            message_id=message_id,
         )
         return True
-    except Exception as fwd_err:
-        print(f"[sendphoto] forward failed: {fwd_err}")
-        try:
-            await client.copy_message(
-                chat_id=target_chat_id,
-                from_chat_id=from_chat_id,
-                message_id=message_id,
-            )
-            return True
-        except Exception as copy_err:
-            print(f"[sendphoto] copy failed: {copy_err}")
-            return False
+    except Exception as copy_err:
+        log.warning("copy failed: %s", copy_err)
+        return False
 
 
 def register_sendphoto_handler(user_client: Client, owner_id: str):
@@ -196,13 +248,14 @@ def register_sendphoto_handler(user_client: Client, owner_id: str):
 
     @user_client.on_message(
         filters.private & ~filters.me & ~filters.bot & ~filters.service,
-        group=-1,  # FIX: runs BEFORE aichat's group-0 handler, else it never fires
+        group=-1,  # runs BEFORE aichat's group-0 handler
     )
     async def paid_photo_trigger(client: Client, message: Message):
         if not message.text or not is_send_trigger(message.text):
             return
 
-        if not await account_has_paid_post(owner_id_str):
+        posts = await get_paid_posts(owner_id_str)
+        if not posts:
             return  # no post set -> fall through, AI auto-reply handles it
 
         try:
@@ -212,7 +265,14 @@ def register_sendphoto_handler(user_client: Client, owner_id: str):
 
         ok = await forward_saved_post(client, owner_id_str, message.chat.id)
         if not ok:
-            print(f"[sendphoto] could not share saved post for account {owner_id_str}")
+            log.warning("could not share saved post for account %s", owner_id_str)
+            # Never leave the user with silence: the copy failed.
+            try:
+                await message.reply_text(
+                    "Post is unavailable right now, please try again later. 🙏"
+                )
+            except Exception as e:
+                log.warning("fallback error reply failed: %s", e)
 
         # Post delivered (or attempted) — stop AI from also replying.
         raise StopPropagation
