@@ -1,6 +1,6 @@
 import asyncio
 import os
-import time
+import platform
 
 from dotenv import load_dotenv
 
@@ -23,7 +23,7 @@ from sendphoto import (
     save_post_from_link,
 )
 from stats import get_stats_text
-from storage import load_data, save_data, update_data
+from storage import DATA_FILE, load_data, update_data
 
 API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
@@ -31,9 +31,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "sexyiwowu")
 
-# ------------------------- ADMIN AUTH ------------------------- #
-# Only these user IDs can operate the bot. Set in .env as comma-separated IDs:
-# ADMIN_IDS=123456789,987654321
 ADMIN_IDS = {
     int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 }
@@ -51,8 +48,6 @@ def is_admin(user_id: int) -> bool:
 
 
 # ------------------------- KEYBOARDS ------------------------- #
-# Telegram auto-sizes buttons to their label text. Short labels keep rows
-# compact and prevent tall wrapped buttons.
 
 def get_start_markup():
     return InlineKeyboardMarkup([
@@ -90,7 +85,7 @@ def get_dashboard_text():
         "• **➕ Add Account** — Connect a Pyrogram String Session\n"
         "• **🗄 Accounts** — View connected accounts\n"
         "• **⚡ Toggle AI** — Turn AI Auto-Reply ON / OFF\n"
-        "• **💎 Paid Photo** — Set channel posts to deliver on trigger words "
+        "• **💎 Paid Photo** — Channel posts delivered on trigger words "
         "(rotates 1st trigger → post 1, next → post 2, …)\n"
         "• **📊 Stats** — VPS & CPU performance"
     )
@@ -114,7 +109,6 @@ async def start_handler(client, message: Message):
 
 @bot.on_callback_query()
 async def callback_handler(client, query: CallbackQuery):
-    # AUTH GATE — only admins can operate anything
     if not is_admin(query.from_user.id):
         await query.answer("⛔ Not authorized.", show_alert=True)
         return
@@ -161,9 +155,9 @@ async def callback_handler(client, query: CallbackQuery):
             "**Step 1** — Tap an account below.\n"
             "**Step 2** — Add as many channel post links as you want.\n\n"
             "Trigger words found anywhere in a DM (`send`, `.send`, `star`) "
-            "deliver posts in round-robin rotation — 1st trigger sends post 1, "
-            "next sends post 2, then it loops. Posts are sent directly "
-            "(no 'Forwarded from' header) and AI won't reply to triggers.\n\n"
+            "deliver posts in round-robin rotation. Posts are sent directly "
+            "(no 'Forwarded from' header) and AI won't reply to delivered "
+            "triggers.\n\n"
             "🟢 Online · ⚪ Offline · 📎 Posts saved · ➕ No post"
         )
         btns = []
@@ -208,7 +202,6 @@ async def callback_handler(client, query: CallbackQuery):
             [InlineKeyboardButton("🧹 Clear All", callback_data=f"photo_clear_{target_uid}")],
             [InlineKeyboardButton("⬅️ Accounts", callback_data="set_photo_menu")],
         ]
-        # One remove button per post (2 per row keeps the menu tidy).
         for i in range(len(posts)):
             if i % 2 == 0:
                 btns.insert(-1, [])
@@ -372,12 +365,14 @@ async def callback_handler(client, query: CallbackQuery):
 
 @bot.on_message(filters.private & ~filters.command(["start"]))
 async def user_input_handler(client, message: Message):
-    # AUTH GATE — only admins can add accounts / set posts
     if not is_admin(message.from_user.id):
         return
 
-    # Guard non-text input (sticker/photo while in a waiting state)
     if not message.text:
+        return
+
+    # Commands must never be consumed as session/post input.
+    if message.text.startswith(("/", ".", "!")):
         return
 
     user_id = str(message.from_user.id)
@@ -401,8 +396,6 @@ async def user_input_handler(client, message: Message):
             acc_uid = str(me.id)
             acc_name = me.first_name or f"User {acc_uid}"
 
-            # sendphoto first (group -1), then aichat (group 0), so the
-            # paid-photo trigger always gets priority over AI replies.
             register_sendphoto_handler(user_client, acc_uid)
             register_ai_handler(user_client, acc_uid, OPENROUTER_API_KEY)
             connected_clients[acc_uid] = user_client
@@ -428,7 +421,8 @@ async def user_input_handler(client, message: Message):
                 f"✅ **Session Successfully Connected!**\n\n"
                 f"• **Account Name:** {acc_name}\n"
                 f"• **User ID:** `{acc_uid}`\n"
-                f"• **Auto Photo Trigger:** Active (`send`, `.send`, `star` — rotating posts)",
+                f"• **Auto Photo Trigger:** Active (`send`, `.send`, `star` — rotating posts)\n\n"
+                f"🩺 Verify: send `.aiping` from that account's own chat.",
                 reply_markup=markup,
             )
 
@@ -480,8 +474,10 @@ async def main():
     await bot.start()
     print("Dashboard Control Panel Started!")
 
-    # Restore session instances on service boot
     data = await load_data()
+
+    # Restore session instances on service boot
+    restored, failed = 0, 0
     for uid, udata in data.get("users", {}).items():
         try:
             cli = Client(
@@ -491,20 +487,28 @@ async def main():
                 session_string=udata["session"],
                 in_memory=True,
             )
-            # sendphoto first (group -1), then aichat (group 0)
             register_sendphoto_handler(cli, str(uid))
             register_ai_handler(cli, uid, OPENROUTER_API_KEY)
             await cli.start()
+            me = await cli.get_me()  # verify the session actually resolves
             connected_clients[str(uid)] = cli
-            print(f"Session Active: {uid}")
+            restored += 1
+            print(f"Session Active: {uid} ({me.first_name})")
         except Exception as e:
-            print(f"Failed Session Restore for {uid}: {e}")
+            failed += 1
+            print(f"❌ Failed Session Restore for {uid}: {type(e).__name__}: {e}")
+
+    print(f"Restore summary: {restored} active, {failed} FAILED"
+          + ("  ⚠️ FAILED SESSIONS RECEIVE NO DMs — AI and triggers are dead for them."
+             if failed else ""))
+
+    if not connected_clients:
+        print("⚠️ NO userbot sessions online. AI auto-reply and paid-photo triggers "
+              "will not work until a session is added via the dashboard bot.")
 
     print("All sessions restored. Running...")
     await idle()
 
-    # Graceful shutdown — never let a broken client or dispatcher
-    # crash the exit sequence.
     print("Shutting down...")
     for uid, cli in list(connected_clients.items()):
         try:
@@ -521,12 +525,19 @@ async def main():
 
 
 if __name__ == "__main__":
-    # Pyrogram 2.0 binds its dispatcher queues to the event loop that is
-    # current when the Clients are constructed (at import time, above).
-    # asyncio.run() creates a NEW loop -> "attached to a different loop"
-    # on shutdown. Using get_event_loop() + run_until_complete() keeps
-    # everything on the same loop, matching how the clients were created.
-    loop = asyncio.get_event_loop()
+    # NEW: explicit loop creation. Pyrogram 2.0 binds dispatcher queues to the
+    # loop current at Client construction (import time); this keeps the SAME
+    # loop for run_until_complete, and avoids the bare get_event_loop()
+    # deprecation on Python 3.12+.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    print(f"[diag] python {platform.python_version()} | "
+          f"pyrogram {__import__('pyrogram.version', fromlist=['__version__']).__version__}")
+    print(f"[diag] admins configured: {len(ADMIN_IDS)} | "
+          f"openrouter key: {'set ✅' if OPENROUTER_API_KEY else 'MISSING ❌'} | "
+          f"api_id: {'set' if API_ID else 'MISSING'}")
+
     try:
         loop.run_until_complete(main())
     except (KeyboardInterrupt, SystemExit):
