@@ -1,11 +1,12 @@
 import asyncio
 import os
+import time
 
 import requests
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-from storage import DEFAULT_PERSONA, load_data, save_data, update_data
+from storage import DEFAULT_PERSONA, load_data, update_data
 
 # --------------------------- CONFIG --------------------------- #
 
@@ -39,7 +40,9 @@ def _openrouter_error_text(resp: requests.Response) -> str:
 
 
 def _post_openrouter(payload: dict, headers: dict) -> requests.Response:
-    return requests.post(OPENROUTER_URL, json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+    return requests.post(
+        OPENROUTER_URL, json=payload, headers=headers, timeout=REQUEST_TIMEOUT
+    )
 
 
 # Returns (text, retry_after, is_real_reply)
@@ -67,7 +70,12 @@ async def generate_ai_reply(persona: str, history: list, user_message: str, api_
     last_user_error = "Currently busy, will respond in a bit! 🙏"
 
     for model in models:
-        payload = {"model": model, "messages": messages, "max_tokens": 200, "temperature": 0.9}
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": 200,
+            "temperature": 0.9,
+        }
         for attempt in range(2):
             try:
                 resp = await asyncio.to_thread(_post_openrouter, payload, headers)
@@ -79,13 +87,17 @@ async def generate_ai_reply(persona: str, history: list, user_message: str, api_
                     except (TypeError, ValueError):
                         pass
                     print(f"[aichat] 429 from OpenRouter model={model}")
-                    return ("Quota limit reached, please try again in a bit! 🙏", retry_after, False)
+                    return (
+                        "Quota limit reached, please try again in a bit! 🙏",
+                        retry_after,
+                        False,
+                    )
 
                 if resp.status_code >= 400:
                     detail = _openrouter_error_text(resp)
                     print(f"[aichat] OpenRouter {resp.status_code} model={model}: {detail}")
                     if resp.status_code in (400, 404) and model != models[-1]:
-                        break
+                        break  # try fallback model
                     if resp.status_code >= 500:
                         continue
                     return (last_user_error, None, False)
@@ -140,14 +152,14 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         key_status = "Set ✅" if api_key else "Missing ❌"
         blocked_count = len(data.get("blocked", []))
         persona = data.get("persona", DEFAULT_PERSONA)
+
         cmd_help = (
             "🤖 **AI Chat Control Panel**\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"• **Status:** {status}\n"
             f"• **API Key:** {key_status}\n"
             f"• **Model:** `{OPENROUTER_MODEL}`\n"
-            f"• **Blocked Users:** {blocked_count}\n"
-            f"• **Persona:** `{persona}`\n\n"
+            f"• **Blocked Users:** {blocked_count}\n\n"
             "📌 **Available Commands:**\n"
             "• `.aichat` — Show this help menu & status\n"
             "• `.aichaton` — Turn AI ON globally\n"
@@ -164,18 +176,20 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         target = await _resolve_target(client, message)
 
         if target is None:
-            await update_data(
-                lambda d: d.setdefault("users", {}).setdefault(owner_id_str, {}).update(
-                    {"ai_enabled": True}
-                )
-            )
+            def _global_on(d):
+                d.setdefault("users", {}).setdefault(owner_id_str, {})["ai_enabled"] = True
+            await update_data(_global_on)
             await message.edit_text("✅ AI Auto-Reply turned **ON** globally.")
             return
 
         uid = str(target.id)
-        await update_data(
-            lambda d: d["blocked"].remove(uid) if uid in d.get("blocked", []) else None
-        )
+
+        def _unblock(d):
+            blocked = d.get("blocked", [])
+            if uid in blocked:
+                blocked.remove(uid)
+
+        await update_data(_unblock)
         await message.edit_text(f"✅ AI Auto-Reply turned **ON** for **{_name(target)}**.")
 
     @user_client.on_message(filters.me & filters.command("aichatoff", prefixes=[".", "!", "/"]))
@@ -183,18 +197,20 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         target = await _resolve_target(client, message)
 
         if target is None:
-            await update_data(
-                lambda d: d.setdefault("users", {}).setdefault(owner_id_str, {}).update(
-                    {"ai_enabled": False}
-                )
-            )
+            def _global_off(d):
+                d.setdefault("users", {}).setdefault(owner_id_str, {})["ai_enabled"] = False
+            await update_data(_global_off)
             await message.edit_text("❌ AI Auto-Reply turned **OFF** globally.")
             return
 
         uid = str(target.id)
-        await update_data(
-            lambda d: d.setdefault("blocked", []).append(uid) if uid not in d.get("blocked", []) else None
-        )
+
+        def _block(d):
+            blocked = d.setdefault("blocked", [])
+            if uid not in blocked:
+                blocked.append(uid)
+
+        await update_data(_block)
         await message.edit_text(f"🚫 AI Auto-Reply disabled for **{_name(target)}**.")
 
     @user_client.on_message(filters.me & filters.command("aichatunblock", prefixes=[".", "!", "/"]))
@@ -205,9 +221,13 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
             return
 
         uid = str(target.id)
-        await update_data(
-            lambda d: d["blocked"].remove(uid) if uid in d.get("blocked", []) else None
-        )
+
+        def _unblock(d):
+            blocked = d.get("blocked", [])
+            if uid in blocked:
+                blocked.remove(uid)
+
+        await update_data(_unblock)
         await message.edit_text(f"✅ AI Auto-Reply unblocked for **{_name(target)}**.")
 
     @user_client.on_message(filters.me & filters.command("aichatreset", prefixes=[".", "!", "/"]))
@@ -229,11 +249,8 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
 
         persona_text = message.text.split(None, 1)[1]
         await update_data(lambda d: d.update(persona=persona_text))
-        await message.edit_text(
-            "✅ AI Persona updated.", parse_mode=None
-        )
-        # Send raw persona separately without markdown parsing to avoid
-        # backtick/markdown injection breaking the echo.
+        await message.edit_text("✅ AI Persona updated.")
+        # Echo raw without markdown parsing so backticks can't break rendering.
         await message.reply(f"Current persona:\n{persona_text}", parse_mode=None)
 
     @user_client.on_message(
@@ -253,7 +270,7 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         if not user_config.get("ai_enabled", True):
             return
 
-        # FIX: guard — ignore non-text messages (stickers, photos, etc.)
+        # FIX: guard non-text input (sticker/photo/video in DM used to crash)
         if not message.from_user or not message.text:
             return
 
@@ -262,7 +279,7 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         if user_id in data.get("blocked", []):
             return
 
-        # Paid-photo trigger words: skip AI so only the saved post is sent.
+        # Paid-photo trigger words skip AI so only the saved post is sent.
         try:
             from sendphoto import is_send_trigger
 
@@ -273,15 +290,19 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
 
         now = time.time()
 
-        # FIX: per-user rate limit (was global — one user's 429 paused everyone)
+        # FIX: per-user rate limit instead of one global timestamp
         rl_key = f"rate_limited_until_{user_id}"
-        if now < data.get(rl, 0) if False else now < data.get(rl_key := f"rate_limited_until_{user_id}", 0):
+        if now < data.get(rl_key, 0):
             return
 
         last_time = data.get("last_msg_time", {}).get(user_id, 0)
         if now - last_time < COOLDOWN_SECONDS:
             return
-        await update_data(lambda d: d.setdefault("last_msg_time", {}).__setitem__(user_id, now))
+
+        def _set_cooldown(d):
+            d.setdefault("last_msg_time", {})[user_id] = now
+
+        await update_data(_set_cooldown)
 
         chat_history = data.get("history", {}).get(user_id, [])
         persona = data.get("persona", DEFAULT_PERSONA)
@@ -296,7 +317,9 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         )
 
         if retry_after:
-            await update_data(lambda d: d.update({rl_key: time.time() + retry_after}))
+            def _set_rl(d):
+                d.setdefault("rate_limited_until", {})[user_id] = time.time() + retry_after
+            await update_data(_set_rl)
 
         try:
             await message.reply_text(reply_text)
@@ -304,14 +327,14 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
             print(f"[aichat.py] Reply error: {e}")
             return
 
-        # FIX: never store error strings as assistant context
+        # FIX: error strings ("Currently busy...") must NOT pollute chat history
         if not is_real:
             return
 
-        def _append(d):
+        def _append_history(d):
             h = d.setdefault("history", {}).setdefault(user_id, [])
             h.append({"role": "user", "text": message.text})
             h.append({"role": "assistant", "text": reply_text})
             d["history"][user_id] = h[-(MAX_HISTORY_TURNS * 2):]
 
-        await update_data(_append)
+        await update_data(_append_history)
