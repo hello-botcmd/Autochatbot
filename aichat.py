@@ -3,12 +3,15 @@ import os
 import time
 import traceback
 
+import pyrogram
 import requests
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.version import __version__ as PYROGRAM_VERSION
 
 from storage import DEFAULT_PERSONA, load_data, update_data
+
+PYROGRAM_VERSION = getattr(pyrogram, "__version__", "unknown")
+
 
 # --------------------------- CONFIG --------------------------- #
 
