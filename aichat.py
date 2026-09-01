@@ -19,7 +19,7 @@ CREDITS_URL = "https://openrouter.ai/api/v1/credits"
 
 MAX_HISTORY_TURNS = 6
 COOLDOWN_SECONDS = 5
-REQUEST_TIMEOUT = 20  # was 45s (2 models x 2 attempts x 45s = 3 min worst case)
+REQUEST_TIMEOUT = 20
 
 # Owner notification cooldown after a quota-429 (hours).
 QUOTA_NOTIFY_COOLDOWN_HOURS = int(os.getenv("QUOTA_NOTIFY_COOLDOWN_HOURS", "6"))
@@ -76,8 +76,6 @@ def _post_openrouter(payload: dict, headers: dict) -> requests.Response:
 
 
 # Returns (text, retry_after, is_real_reply, quota_model)
-# quota_model is the model that returned the 429 (None if no quota hit),
-# so the owner alert attributes the failure to the right model.
 async def generate_ai_reply(persona: str, history: list, user_message: str, api_key: str) -> tuple:
     if not api_key:
         return ("AI is not configured. Please set OPENROUTER_API_KEY first. 🙏", None, False, None)
@@ -178,11 +176,6 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         )
 
     async def _notify_owner_quota(model: str):
-        """Notify the account owner (Saved Messages) that AI quota is over.
-
-        Fires at most once per QUOTA_NOTIFY_COOLDOWN_HOURS, tracked in
-        data.json under users[owner_id]["quota_notify_until"].
-        """
         now = time.time()
 
         def _check_cooldown(d):
@@ -217,7 +210,6 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
             lines.insert(7, "")
 
         try:
-            # "me" = Saved Messages of the userbot account itself.
             await user_client.send_message("me", "\n".join(lines))
         except Exception as e:
             print(f"[aichat] quota notify failed: {e}")
@@ -353,7 +345,6 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         persona_text = message.text.split(None, 1)[1]
         await update_data(lambda d: d.update(persona=persona_text))
         await message.edit_text("✅ AI Persona updated.")
-        # Echo raw without markdown parsing so backticks can't break rendering.
         await message.reply(f"Current persona:\n{persona_text}", parse_mode=None)
 
     # ------------------------ DM AUTO-REPLY -------------------------- #
@@ -376,7 +367,13 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         if not user_config.get("ai_enabled", True):
             return
 
-        # Guard non-text input (sticker/photo/video in DM)
+        # FIX (AI silent): the old is_send_trigger() check here is REMOVED.
+        # With sentence matching on, it short-circuited AI for ANY message
+        # containing "send"/"star". sendphoto's group -1 handler is the sole
+        # gatekeeper: it raises StopPropagation ONLY when a post was actually
+        # delivered, so this handler either never runs (post sent) or falls
+        # through to a real AI reply (no posts / delivery failed).
+
         if not message.from_user or not message.text:
             return
 
@@ -385,20 +382,10 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         if user_id in data.get("blocked", []):
             return
 
-        # Trigger words anywhere in the sentence ("please send it") skip AI
-        # so only the rotating saved post is sent.
-        try:
-            from sendphoto import is_send_trigger
-
-            if is_send_trigger(message.text):
-                return
-        except Exception:
-            pass
-
         now = time.time()
 
-        # Per-user 429 rate limit (FIX: read from the nested dict where the
-        # write path actually stores it — the old flat-key read never matched).
+        # Per-user 429 rate limit (reads the nested dict where the write
+        # path stores it — the old flat-key read never matched).
         if now < data.get("rate_limited_until", {}).get(user_id, 0):
             return
 
@@ -424,8 +411,6 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         )
 
         if retry_after:
-            # 429 = quota exhausted: alert the owner (cooldown-protected),
-            # attributing the alert to the model that actually failed.
             asyncio.create_task(_notify_owner_quota(quota_model or OPENROUTER_MODEL))
 
             def _set_rl(d):
@@ -438,7 +423,6 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
             print(f"[aichat.py] Reply error: {e}")
             return
 
-        # Error strings ("Currently busy...") must NOT pollute chat history
         if not is_real:
             return
 
