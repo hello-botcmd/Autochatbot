@@ -1,5 +1,4 @@
 import asyncio
-import logging
 import os
 import time
 
@@ -8,8 +7,6 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 
 from storage import DEFAULT_PERSONA, load_data, update_data
-
-log = logging.getLogger(__name__)
 
 # --------------------------- CONFIG --------------------------- #
 
@@ -22,7 +19,7 @@ CREDITS_URL = "https://openrouter.ai/api/v1/credits"
 
 MAX_HISTORY_TURNS = 6
 COOLDOWN_SECONDS = 5
-REQUEST_TIMEOUT = 20
+REQUEST_TIMEOUT = 20  # was 45s (2 models x 2 attempts x 45s = 3 min worst case)
 
 # Owner notification cooldown after a quota-429 (hours).
 QUOTA_NOTIFY_COOLDOWN_HOURS = int(os.getenv("QUOTA_NOTIFY_COOLDOWN_HOURS", "6"))
@@ -78,10 +75,12 @@ def _post_openrouter(payload: dict, headers: dict) -> requests.Response:
     )
 
 
-# Returns (text, retry_after, is_real_reply)
+# Returns (text, retry_after, is_real_reply, quota_model)
+# quota_model is the model that returned the 429 (None if no quota hit),
+# so the owner alert attributes the failure to the right model.
 async def generate_ai_reply(persona: str, history: list, user_message: str, api_key: str) -> tuple:
     if not api_key:
-        return ("AI is not configured. Please set OPENROUTER_API_KEY first. 🙏", None, False)
+        return ("AI is not configured. Please set OPENROUTER_API_KEY first. 🙏", None, False, None)
 
     messages = [{"role": "system", "content": persona}]
     for turn in history:
@@ -92,13 +91,9 @@ async def generate_ai_reply(persona: str, history: list, user_message: str, api_
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        "HTTP-Referer": os.getenv("OPENROUTER_REFERER", "https://t.me/nonsecularman"),
         "X-Title": "RAUSHAN Userbot",
     }
-    # Only send a referer if explicitly configured (avoid leaking a real
-    # handle by default).
-    referer = os.getenv("OPENROUTER_REFERER", "")
-    if referer:
-        headers["HTTP-Referer"] = referer
 
     models = [OPENROUTER_MODEL]
     if OPENROUTER_FALLBACK_MODEL and OPENROUTER_FALLBACK_MODEL not in models:
@@ -123,46 +118,41 @@ async def generate_ai_reply(persona: str, history: list, user_message: str, api_
                         retry_after = int(resp.headers.get("Retry-After", retry_after))
                     except (TypeError, ValueError):
                         pass
-                    if model != models[-1]:
-                        # 429 on the primary model is often a model-specific
-                        # rate limit, NOT global quota exhaustion. Try the
-                        # fallback model before declaring quota death.
-                        log.warning("429 from %s, trying fallback model", model)
-                        break
-                    log.warning("429 from OpenRouter model=%s (final)", model)
+                    print(f"[aichat] 429 from OpenRouter model={model}")
                     return (
                         "Quota limit reached, please try again in a bit! 🙏",
                         retry_after,
                         False,
+                        model,
                     )
 
                 if resp.status_code >= 400:
                     detail = _openrouter_error_text(resp)
-                    log.warning("OpenRouter %s model=%s: %s", resp.status_code, model, detail)
+                    print(f"[aichat] OpenRouter {resp.status_code} model={model}: {detail}")
                     if resp.status_code in (400, 404) and model != models[-1]:
                         break  # try fallback model
                     if resp.status_code >= 500:
                         continue
-                    return (last_user_error, None, False)
+                    return (last_user_error, None, False, None)
 
                 data = resp.json()
                 text = data["choices"][0]["message"]["content"].strip()
                 if model != OPENROUTER_MODEL:
-                    log.info("fallback model used: %s", model)
-                return (text, None, True)
+                    print(f"[aichat] fallback model used: {model}")
+                return (text, None, True, None)
 
             except requests.exceptions.Timeout:
-                log.warning("timeout model=%s attempt=%s", model, attempt + 1)
+                print(f"[aichat] timeout model={model} attempt={attempt + 1}")
                 last_user_error = "Service is slow right now, please resend your message. 🙏"
                 continue
             except requests.exceptions.RequestException as e:
-                log.warning("request error model=%s: %s", model, e)
+                print(f"[aichat] request error model={model}: {e}")
                 continue
             except (KeyError, IndexError, TypeError, ValueError) as e:
-                log.warning("bad OpenRouter payload: %s", e)
-                return ("Could not understand that, please try again. 🙏", None, False)
+                print(f"[aichat] bad OpenRouter payload: {e}")
+                return ("Could not understand that, please try again. 🙏", None, False, None)
 
-    return (last_user_error, None, False)
+    return (last_user_error, None, False, None)
 
 
 # ---------------------- DYNAMIC REGISTER FUNCTION ------------------ #
@@ -230,7 +220,7 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
             # "me" = Saved Messages of the userbot account itself.
             await user_client.send_message("me", "\n".join(lines))
         except Exception as e:
-            log.warning("quota notify failed: %s", e)
+            print(f"[aichat] quota notify failed: {e}")
 
     # -------------------------- COMMANDS ---------------------------- #
 
@@ -260,7 +250,9 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         status = "ON ✅" if user_config.get("ai_enabled", True) else "OFF ❌"
         key_status = "Set ✅" if api_key else "Missing ❌"
         blocked_count = len(data.get("blocked", []))
-        persona = data.get("persona", DEFAULT_PERSONA)
+        posts = user_config.get("paid_photos") or (
+            [user_config["paid_photo"]] if user_config.get("paid_photo") else []
+        )
 
         cmd_help = (
             "🤖 **AI Chat Control Panel**\n"
@@ -268,7 +260,8 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
             f"• **Status:** {status}\n"
             f"• **API Key:** {key_status}\n"
             f"• **Model:** `{OPENROUTER_MODEL}`\n"
-            f"• **Blocked Users:** {blocked_count}\n\n"
+            f"• **Blocked Users:** {blocked_count}\n"
+            f"• **Paid Posts:** {len(posts)} (rotation)\n\n"
             "📌 **Available Commands:**\n"
             "• `.aichat` — Show this help menu & status\n"
             "• `.aichaton` — Turn AI ON globally\n"
@@ -348,12 +341,7 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
             return
 
         uid = str(target.id)
-
-        def _reset(d):
-            # History is per userbot account now.
-            d.get("history", {}).get(owner_id_str, {}).pop(uid, None)
-
-        await update_data(_reset)
+        await update_data(lambda d: d.get("history", {}).pop(uid, None))
         await message.edit_text(f"🧹 Cleared chat history for **{_name(target)}**.")
 
     @user_client.on_message(filters.me & filters.command("setpersona", prefixes=[".", "!", "/"]))
@@ -368,7 +356,6 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         # Echo raw without markdown parsing so backticks can't break rendering.
         await message.reply(f"Current persona:\n{persona_text}", parse_mode=None)
 
-    # ------------------------ DM AUTO-REPLY -------------------------- #
     # ------------------------ DM AUTO-REPLY -------------------------- #
 
     @user_client.on_message(
@@ -394,39 +381,37 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
             return
 
         user_id = str(message.from_user.id)
-        log.debug("AI handler fired: owner=%s from=%s text=%r",
-                  owner_id_str, user_id, message.text[:40])
 
         if user_id in data.get("blocked", []):
             return
 
+        # Trigger words anywhere in the sentence ("please send it") skip AI
+        # so only the rotating saved post is sent.
+        try:
+            from sendphoto import is_send_trigger
+
+            if is_send_trigger(message.text):
+                return
+        except Exception:
+            pass
+
         now = time.time()
 
-        # Post-429 per-user cooldown (global across accounts).
+        # Per-user 429 rate limit (FIX: read from the nested dict where the
+        # write path actually stores it — the old flat-key read never matched).
         if now < data.get("rate_limited_until", {}).get(user_id, 0):
             return
 
-        # Per-user cooldown: check + set atomically so two near-simultaneous
-        # DMs can't both pass the check. (Storage migrates legacy flat
-        # entries, so owner_id_str is always a dict here.)
-        def _check_cooldown(d):
-            per_owner = d.setdefault("last_msg_time", {}).setdefault(owner_id_str, {})
-            if not isinstance(per_owner, dict):
-                per_owner = {}
-                d["last_msg_time"][owner_id_str] = per_owner
-            if now - per_owner.get(user_id, 0) < COOLDOWN_SECONDS:
-                return False
-            per_owner[user_id] = now
-            return True
-
-        if not await update_data(_check_cooldown):
+        last_time = data.get("last_msg_time", {}).get(user_id, 0)
+        if now - last_time < COOLDOWN_SECONDS:
             return
 
-        # History is per userbot account, per sender.
-        per_owner_history = data.get("history", {}).get(owner_id_str, {})
-        if not isinstance(per_owner_history, dict):
-            per_owner_history = {}
-        chat_history = per_owner_history.get(user_id, [])
+        def _set_cooldown(d):
+            d.setdefault("last_msg_time", {})[user_id] = now
+
+        await update_data(_set_cooldown)
+
+        chat_history = data.get("history", {}).get(user_id, [])
         persona = data.get("persona", DEFAULT_PERSONA)
 
         try:
@@ -434,13 +419,14 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         except Exception:
             pass
 
-        reply_text, retry_after, is_real = await generate_ai_reply(
+        reply_text, retry_after, is_real, quota_model = await generate_ai_reply(
             persona, chat_history, message.text, api_key
         )
 
         if retry_after:
-            # 429 = quota exhausted: alert the owner (cooldown-protected).
-            asyncio.create_task(_notify_owner_quota(OPENROUTER_MODEL))
+            # 429 = quota exhausted: alert the owner (cooldown-protected),
+            # attributing the alert to the model that actually failed.
+            asyncio.create_task(_notify_owner_quota(quota_model or OPENROUTER_MODEL))
 
             def _set_rl(d):
                 d.setdefault("rate_limited_until", {})[user_id] = time.time() + retry_after
@@ -449,7 +435,7 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
         try:
             await message.reply_text(reply_text)
         except Exception as e:
-            log.warning("reply error: %s", e)
+            print(f"[aichat.py] Reply error: {e}")
             return
 
         # Error strings ("Currently busy...") must NOT pollute chat history
@@ -457,13 +443,9 @@ def register_ai_handler(user_client: Client, owner_id: str, api_key: str):
             return
 
         def _append_history(d):
-            per_owner = d.setdefault("history", {}).setdefault(owner_id_str, {})
-            if not isinstance(per_owner, dict):
-                per_owner = {}
-                d["history"][owner_id_str] = per_owner
-            h = per_owner.setdefault(user_id, [])
+            h = d.setdefault("history", {}).setdefault(user_id, [])
             h.append({"role": "user", "text": message.text})
             h.append({"role": "assistant", "text": reply_text})
-            per_owner[user_id] = h[-(MAX_HISTORY_TURNS * 2):]
+            d["history"][user_id] = h[-(MAX_HISTORY_TURNS * 2):]
 
         await update_data(_append_history)
