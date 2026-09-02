@@ -2,20 +2,20 @@
 
 • Trigger words detected anywhere in a sentence ("please send it").
 • Multiple saved posts per account, round-robin rotation.
-• Delivery chain (goal: NO 'Forwarded from' header):
-    1. copy_message / copy_media_group  -> clean copy, no header
-    2. download + re-upload             -> clean, works where copy fails
-    3. forward                          -> LAST RESORT only (header appears,
-       logged loudly). Fix properly with pyrogram>=2.0.30 / pyrofork, or unset
-       'restrict saving content' on the source channel.
-• The group -1 handler NEVER lets an exception escape: on Pyrogram, an
-  exception here aborts later handler groups (aichat's group 0) for the same
-  update — one of the classic ways AI replies went silent.
+• Delivery chain (goal: NO 'Forwarded from' header, ever):
+    1. copy_message / copy_media_group   -> clean copy, no header
+    2. in-memory re-upload (BytesIO)     -> clean, preserves caption
+    3. per-item album re-upload          -> clean, whole media group
+    4. forward                           -> ABSOLUTE last resort (header WILL
+       show). Loudly logged so the cause is visible instead of silence.
+• The group -1 handler NEVER lets an exception escape (an exception here
+  aborts Pyrogram's later handler groups — AI's group 0 — for the update).
 """
 
 import os
 import re
 from copy import deepcopy
+from io import BytesIO
 
 from pyrogram import Client, StopPropagation, filters
 from pyrogram.types import Message
@@ -29,6 +29,13 @@ TRIGGER_IN_SENTENCE = os.getenv("TRIGGER_IN_SENTENCE", "1") == "1"
 _TRIGGER_RES = [re.compile(rf"(?<!\w){re.escape(w)}(?!\w)") for w in PHOTO_TRIGGERS]
 
 _RESERVED_PUBLIC_PATHS = {"c", "s", "addstickers", "joinchat", "share", "boost", "proxy"}
+
+# Clean re-send plumbing: media attribute -> default filename -> client method.
+_MEDIA_KINDS = ("photo", "video", "document", "audio", "voice", "animation")
+_EXT_MAP = {"photo": ".jpg", "video": ".mp4", "document": "", "audio": ".mp3",
+            "voice": ".ogg", "animation": ".gif"}
+_SEND_MAP = {"photo": "send_photo", "video": "send_video", "document": "send_document",
+             "audio": "send_audio", "voice": "send_voice", "animation": "send_animation"}
 
 
 def is_send_trigger(text: str) -> bool:
@@ -244,71 +251,88 @@ async def _resolve_source_chat(client: Client, post: dict):
         return chat_id
 
 
-async def _reupload_message(client: Client, from_chat_id, message_id,
-                            target_chat_id: int) -> bool:
-    try:
-        msg = await client.get_messages(from_chat_id, message_id)
-    except Exception as e:
-        print(f"[sendphoto] reupload get_messages failed: {e}")
-        return False
-    if getattr(msg, "media_group_id", None):
-        return False
+async def _reupload_single(client: Client, msg: Message, target_chat_id: int,
+                           keep_caption: bool = True) -> bool:
+    """Re-send one message AS the userbot (clean, no header). Uses in-memory
+    bytes + BytesIO naming so the file keeps a sane filename."""
     try:
         if getattr(msg, "text", None):
             await client.send_message(target_chat_id, msg.text.markdown)
             return True
-        if getattr(msg, "caption", None) and not any(
-            getattr(msg, a, None) for a in
-            ("photo", "video", "document", "audio", "voice", "animation")
-        ):
-            await client.send_message(target_chat_id, msg.caption.markdown)
-            return True
-        path = await msg.download()
-    except Exception as e:
-        print(f"[sendphoto] reupload download failed: {e}")
-        return False
 
-    caption = getattr(msg, "caption", None)
-    send = None
-    if msg.photo:
-        send = client.send_photo
-    elif msg.video:
-        send = client.send_video
-    elif msg.document:
-        send = client.send_document
-    elif msg.audio:
-        send = client.send_audio
-    elif msg.voice:
-        send = client.send_voice
-    elif msg.animation:
-        send = client.send_animation
-    if send is None:
-        return False
-    try:
-        await send(target_chat_id, path, caption=caption)
+        caption = getattr(msg, "caption", None)
+        cap = (caption.markdown if caption else None) if keep_caption else None
+
+        kind = None
+        for k in _MEDIA_KINDS:
+            if getattr(msg, k, None):
+                kind = k
+                break
+        if kind is None:
+            # Caption-only message (no media) -> plain text.
+            if caption:
+                await client.send_message(target_chat_id, caption.markdown)
+                return True
+            return False
+
+        data = await msg.download(in_memory=True)
+        bio = BytesIO(data)
+        media_obj = getattr(msg, kind)
+        fname = getattr(media_obj, "file_name", None) if kind == "document" else None
+        bio.name = fname or f"media{_EXT_MAP[kind]}"
+
+        send = getattr(client, _SEND_MAP[kind], None)
+        if send is None:
+            return False
+        await send(target_chat_id, bio, caption=cap)
         return True
     except Exception as e:
-        print(f"[sendphoto] reupload send failed: {e}")
+        print(f"[sendphoto] reupload_single failed: {e}")
         return False
+
+
+async def _reupload_album(client: Client, from_chat_id, message_id,
+                          target_chat_id: int) -> bool:
+    """Whole media group, re-sent item by item (caption kept on the first)."""
+    try:
+        items = await client.get_media_group(from_chat_id, message_id)
+    except Exception as e:
+        print(f"[sendphoto] get_media_group failed: {e}")
+        return False
+    if not items:
+        return False
+
+    sent = 0
+    for i, item in enumerate(items):
+        ok = await _reupload_single(client, item, target_chat_id,
+                                    keep_caption=(i == 0))
+        if ok:
+            sent += 1
+    return sent > 0
 
 
 async def deliver_saved_post(client: Client, post: dict, target_chat_id: int):
-    """Chain: copy -> re-upload -> forward. Returns (ok, used_forward)."""
+    """Chain: copy -> in-memory re-upload -> per-item album -> forward.
+    Returns (ok: bool, used_forward: bool)."""
     from_chat_id = await _resolve_source_chat(client, post)
     message_id = post["message_id"]
 
+    # Fetch the source once for kind detection (album vs single).
+    msg = None
+    try:
+        msg = await client.get_messages(from_chat_id, message_id)
+    except Exception:
+        pass
+
+    is_album = bool(msg and getattr(msg, "media_group_id", None))
+
     copy_msg = getattr(client, "copy_message", None)
 
+    # 1. Clean copy (no header). copy_message needs pyrogram >= 2.0.30;
+    #    your 2.0.106 has it.
     if copy_msg is not None:
         try:
-            msg = None
-            try:
-                msg = await client.get_messages(from_chat_id, message_id)
-            except Exception:
-                pass
-
-            if (msg and getattr(msg, "media_group_id", None)
-                    and getattr(client, "copy_media_group", None)):
+            if is_album and getattr(client, "copy_media_group", None):
                 await client.copy_media_group(
                     chat_id=target_chat_id,
                     from_chat_id=from_chat_id,
@@ -323,22 +347,27 @@ async def deliver_saved_post(client: Client, post: dict, target_chat_id: int):
             )
             return True, False
         except Exception as e:
-            print(f"[sendphoto] copy failed ({e}); trying re-upload")
+            print(f"[sendphoto] copy failed ({e}); trying clean re-upload")
 
-        if await _reupload_message(client, from_chat_id, message_id, target_chat_id):
+    # 2./3. Clean re-upload (no header) — in-memory bytes, caption preserved.
+    if is_album:
+        if await _reupload_album(client, from_chat_id, message_id, target_chat_id):
             return True, False
     else:
-        print(
-            "[sendphoto] copy_message missing (pyrogram too old, need >= 2.0.30 "
-            "or pyrofork); trying re-upload"
-        )
-        if await _reupload_message(client, from_chat_id, message_id, target_chat_id):
+        if msg is None:
+            try:
+                msg = await client.get_messages(from_chat_id, message_id)
+            except Exception:
+                msg = None
+        if msg is not None and await _reupload_single(client, msg, target_chat_id):
             return True, False
 
+    # 4. ABSOLUTE LAST RESORT: forward — the header WILL be shown. Loudly
+    #    logged so the cause is visible instead of the user getting nothing.
     print(
-        "[sendphoto] FALLING BACK TO FORWARD — 'Forwarded from' header will show. "
-        "Proper fixes: pip install -U pyrofork, or unset 'restrict saving "
-        "content' on the source channel."
+        "[sendphoto] FALLING BACK TO FORWARD — 'Forwarded from' header will "
+        "show (copy AND re-upload both failed; likely 'restrict saving "
+        "content' on the source channel)."
     )
     try:
         await client.forward_messages(
@@ -380,7 +409,6 @@ def register_sendphoto_handler(user_client: Client, owner_id: str):
             )
 
             if not ok:
-                # Fall through to AI instead of StopPropagation — no silence.
                 print(
                     f"[sendphoto] could not deliver post for account "
                     f"{owner_id_str}; falling through to AI"
@@ -395,5 +423,4 @@ def register_sendphoto_handler(user_client: Client, owner_id: str):
         except StopPropagation:
             raise
         except Exception as e:
-            # Never abort later handler groups (AI's group 0).
             print(f"[sendphoto] trigger handler error: {e}")
