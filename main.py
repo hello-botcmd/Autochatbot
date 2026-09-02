@@ -14,6 +14,7 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from aichat import register_ai_handler
+from gcchat import register_gc_handler
 from sendphoto import (
     clear_paid_post,
     format_paid_posts,
@@ -23,7 +24,7 @@ from sendphoto import (
     save_post_from_link,
 )
 from stats import get_stats_text
-from storage import DATA_FILE, load_data, update_data
+from storage import load_data, update_data
 
 API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
@@ -87,7 +88,9 @@ def get_dashboard_text():
         "• **⚡ Toggle AI** — Turn AI Auto-Reply ON / OFF\n"
         "• **💎 Paid Photo** — Channel posts delivered on trigger words "
         "(rotates 1st trigger → post 1, next → post 2, …)\n"
-        "• **📊 Stats** — VPS & CPU performance"
+        "• **📊 Stats** — VPS & CPU performance\n\n"
+        "🧩 **GC AI** — separate module: `.gcon` / `.gcoff` / `.gcignore` "
+        "(send as outgoing messages inside a group)"
     )
 
 
@@ -396,8 +399,11 @@ async def user_input_handler(client, message: Message):
             acc_uid = str(me.id)
             acc_name = me.first_name or f"User {acc_uid}"
 
+            # Registration order: DM triggers (group -1) -> DM AI (group 0)
+            # -> GC AI (own module). Nothing here touches another module.
             register_sendphoto_handler(user_client, acc_uid)
             register_ai_handler(user_client, acc_uid, OPENROUTER_API_KEY)
+            register_gc_handler(user_client, acc_uid, OPENROUTER_API_KEY)
             connected_clients[acc_uid] = user_client
 
             def _save_session(d):
@@ -421,8 +427,8 @@ async def user_input_handler(client, message: Message):
                 f"✅ **Session Successfully Connected!**\n\n"
                 f"• **Account Name:** {acc_name}\n"
                 f"• **User ID:** `{acc_uid}`\n"
-                f"• **Auto Photo Trigger:** Active (`send`, `.send`, `star` — rotating posts)\n\n"
-                f"🩺 Verify: send `.aiping` from that account's own chat.",
+                f"• **DM Auto Photo Trigger:** Active (rotating posts, no header)\n"
+                f"• **GC AI:** OFF — enable with `.gcon` inside a group",
                 reply_markup=markup,
             )
 
@@ -476,7 +482,6 @@ async def main():
 
     data = await load_data()
 
-    # Restore session instances on service boot
     restored, failed = 0, 0
     for uid, udata in data.get("users", {}).items():
         try:
@@ -489,8 +494,9 @@ async def main():
             )
             register_sendphoto_handler(cli, str(uid))
             register_ai_handler(cli, uid, OPENROUTER_API_KEY)
+            register_gc_handler(cli, uid, OPENROUTER_API_KEY)
             await cli.start()
-            me = await cli.get_me()  # verify the session actually resolves
+            me = await cli.get_me()
             connected_clients[str(uid)] = cli
             restored += 1
             print(f"Session Active: {uid} ({me.first_name})")
@@ -527,10 +533,10 @@ async def main():
 if __name__ == "__main__":
     # CRITICAL: Clients (bot + userbots) are constructed at module import,
     # which binds their dispatcher queues to the loop current at that moment.
-    # get_event_loop() here returns that SAME loop object, keeping everything
-    # on one loop. DO NOT "modernize" this to asyncio.new_event_loop() /
-    # asyncio.run() — a second loop means clients start but process ZERO
-    # updates: dashboard bot, AI replies, and triggers all go silent, no errors.
+    # get_event_loop() here returns that SAME loop object. DO NOT "modernize"
+    # this to asyncio.new_event_loop() / asyncio.run() — a second loop means
+    # clients start but process ZERO updates: dashboard bot, DM AI, GC AI and
+    # triggers all go silent, no errors.
     loop = asyncio.get_event_loop()
 
     import pyrogram
